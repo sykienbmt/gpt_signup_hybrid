@@ -12,6 +12,7 @@ from .mail_providers import (
     MailProvider,
     OutlookComboError,
     OutlookProviderUnavailable,
+    build_provider_gmail_rented,
     build_provider_outlook,
     build_provider_worker,
 )
@@ -29,6 +30,10 @@ def _build_mail_provider(request: SignupRequest, *, settings) -> MailProvider:
             state_dir=settings.runtime_dir / "outlook_state",
             proxy=request.proxy,
         )
+    if request.mail_provider == "gmail_rented":
+        if not request.gmail_rented_combo:
+            raise ValueError("mail_provider='gmail_rented' yêu cầu --gmail-pool hoặc gmail_rented_combo")
+        return build_provider_gmail_rented(combo=request.gmail_rented_combo)
     if request.mail_provider == "worker":
         return build_provider_worker(
             logs_url=request.email_logs_url,
@@ -56,6 +61,9 @@ async def run_signup(request: SignupRequest, *, log=print) -> SignupResult:
             if request.birthdate == "2000-01-01":
                 request = request.model_copy(update={"birthdate": profile["birthdate"]})
             log(f"[signup] profile: name={request.name} age={profile['age']} password={request.password}")
+
+        # Lưu password vào result ngay để cli.py có thể dùng kể cả khi fail
+        result.password = request.password
 
         # ── Phase 1: browser → poll OTP → submit OTP → /about-you ──
         t_p1 = time.monotonic()
@@ -88,6 +96,7 @@ async def run_signup(request: SignupRequest, *, log=print) -> SignupResult:
         result.user_id = phase2_result.get("user_id")
         result.account_id = phase2_result.get("account_id")
         result.cookies = phase2_result["cookies"]
+        result.auth_session = phase2_result.get("auth_session")
         result.password = request.password
         result.name = request.name
         # Compute age

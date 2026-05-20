@@ -1,24 +1,14 @@
-"""Pool combo Outlook/Hotmail.
+"""Pool Gmail rented email.
 
 Format pool file (1 dòng = 1 combo):
-    email|password|refresh_token|client_id
-    email|password|refresh_token|client_id
+    email|otp_api_url
+    email|otp_api_url
     ...
 
-Pool tracker:
-    runtime/outlook_state/<email>.json giờ thêm field:
-        used_for_signup: true|false      — true = đã signup ChatGPT thành công, skip
-        last_used_at:    ISO timestamp   — lần cuối thử
-        last_error:      str | null      — lý do skip nếu fail (e.g. registration_disallowed)
-
-Selection strategy:
-    1. Đọc pool file.
-    2. Loop từng combo, check state:
-       - used_for_signup == true → skip.
-       - last_error == 'registration_disallowed' → skip (combo bị OpenAI block, không retry).
-       - last_error == 'invalid_grant' → skip (combo expire token).
-       - Otherwise → return combo này.
-    3. Hết pool mà không có combo dùng được → raise.
+State tracker: runtime/gmail_state/<email>.json
+    used_for_signup: true|false
+    last_error:      str | null
+    last_used_at:    ISO timestamp
 """
 from __future__ import annotations
 
@@ -27,25 +17,22 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
-from .mail_providers import OutlookCombo, OutlookComboError
+from .mail_providers import GmailRentedCombo, GmailRentedComboError
 
 
-# Errors mà 1 khi gặp thì combo coi như chết — không retry
 _TERMINAL_ERRORS = (
     "registration_disallowed",
-    "invalid_grant",
-    "AADSTS50173",   # Refresh token revoked
-    "AADSTS70008",   # Refresh token expired
+    "wrong password — account already exists",
+    "TimeoutError",  # OTP timeout → skip permanently
 )
 
 
-class OutlookPoolError(Exception):
+class GmailPoolError(Exception):
     """Pool fail."""
 
 
 def _state_file(state_dir: Path, email: str) -> Path:
-    safe = email.replace("/", "_")
-    return state_dir / f"{safe}.json"
+    return state_dir / f"{email.replace('/', '_')}.json"
 
 
 def _read_state(state_dir: Path, email: str) -> dict:
@@ -66,64 +53,57 @@ def _write_state(state_dir: Path, email: str, state: dict) -> None:
     tmp.replace(path)
 
 
-def parse_pool_file(path: Path) -> list[OutlookCombo]:
+def parse_pool_file(path: Path) -> list[GmailRentedCombo]:
     """Đọc pool file, return list combo. Skip dòng trống / comment (#)."""
     if not path.exists():
-        raise OutlookPoolError(f"pool file không tồn tại: {path}")
-    combos: list[OutlookCombo] = []
-    seen_emails: set[str] = set()
+        raise GmailPoolError(f"pool file không tồn tại: {path}")
+    combos: list[GmailRentedCombo] = []
+    seen: set[str] = set()
     for line_num, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
         try:
-            combo = OutlookCombo.parse(line)
-        except OutlookComboError as exc:
-            raise OutlookPoolError(f"pool file dòng {line_num}: {exc}") from exc
-        if combo.email.lower() in seen_emails:
-            raise OutlookPoolError(f"pool file dòng {line_num}: email trùng {combo.email}")
-        seen_emails.add(combo.email.lower())
+            combo = GmailRentedCombo.parse(line)
+        except GmailRentedComboError as exc:
+            raise GmailPoolError(f"pool file dòng {line_num}: {exc}") from exc
+        if combo.email.lower() in seen:
+            raise GmailPoolError(f"pool file dòng {line_num}: email trùng {combo.email}")
+        seen.add(combo.email.lower())
         combos.append(combo)
     if not combos:
-        raise OutlookPoolError(f"pool file rỗng: {path}")
+        raise GmailPoolError(f"pool file rỗng: {path}")
     return combos
 
 
 def iter_available(
-    pool: list[OutlookCombo], *, state_dir: Path, log,
-) -> Iterator[OutlookCombo]:
-    """Yield combo còn dùng được, theo thứ tự pool file."""
+    pool: list[GmailRentedCombo], *, state_dir: Path, log,
+) -> Iterator[GmailRentedCombo]:
     for combo in pool:
         state = _read_state(state_dir, combo.email)
         if state.get("used_for_signup"):
-            log(f"[pool] skip {combo.email} — đã signup ChatGPT (used_for_signup=true)")
+            log(f"[gmail_pool] skip {combo.email} — đã signup (used_for_signup=true)")
             continue
         last_error = state.get("last_error")
         if last_error and any(err in last_error for err in _TERMINAL_ERRORS):
-            log(f"[pool] skip {combo.email} — terminal error: {last_error[:80]}")
+            log(f"[gmail_pool] skip {combo.email} — terminal error: {last_error[:80]}")
             continue
-        # Hydrate refresh_token mới nếu state có
-        latest = state.get("refresh_token")
-        if isinstance(latest, str) and latest.startswith("M.C"):
-            combo.refresh_token = latest
         yield combo
 
 
 def pick_first_available(
-    pool: list[OutlookCombo], *, state_dir: Path, log,
-) -> OutlookCombo:
-    """Pick combo đầu tiên còn dùng được."""
+    pool: list[GmailRentedCombo], *, state_dir: Path, log,
+) -> GmailRentedCombo:
     for combo in iter_available(pool, state_dir=state_dir, log=log):
-        log(f"[pool] picked combo {combo.email}")
+        log(f"[gmail_pool] picked {combo.email}")
         return combo
-    raise OutlookPoolError(
+    raise GmailPoolError(
         f"hết combo khả dụng trong pool ({len(pool)} combo total). "
         "Tất cả đã used_for_signup hoặc terminal error."
     )
 
 
 def mark_signup_success(*, state_dir: Path, email: str) -> None:
-    """Đánh dấu combo đã signup thành công."""
     state = _read_state(state_dir, email)
     state["used_for_signup"] = True
     state["used_at"] = datetime.now(timezone.utc).isoformat()
@@ -131,16 +111,22 @@ def mark_signup_success(*, state_dir: Path, email: str) -> None:
     _write_state(state_dir, email, state)
 
 
-def mark_signup_failure(*, state_dir: Path, email: str, error: str) -> None:
-    """Đánh dấu combo fail. Nếu lỗi thuộc terminal, sẽ bị skip lần sau."""
+def mark_signup_failure(
+    *, state_dir: Path, email: str, error: str, registered_password: str | None = None,
+) -> None:
     state = _read_state(state_dir, email)
     state["last_error"] = error
     state["last_failed_at"] = datetime.now(timezone.utc).isoformat()
+    if registered_password:
+        state["registered_password"] = registered_password
     _write_state(state_dir, email, state)
 
 
-def status_summary(pool: list[OutlookCombo], *, state_dir: Path) -> dict:
-    """Tổng kết pool: bao nhiêu used / available / failed."""
+def get_registered_password(*, state_dir: Path, email: str) -> str | None:
+    return _read_state(state_dir, email).get("registered_password")
+
+
+def status_summary(pool: list[GmailRentedCombo], *, state_dir: Path) -> dict:
     used = available = terminal = unknown = 0
     for combo in pool:
         state = _read_state(state_dir, combo.email)

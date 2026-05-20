@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gpt_signup_hybrid"
+version = "0.1.0"
+description = "Automated ChatGPT account registration tool with hybrid approach"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic",
+    "typer",
+    "httpx",
+    "curl_cffi>=0.7",
+    "pyotp",
+    "fastapi",
+    "uvicorn",
+    "camoufox",
+    "playwright",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["gpt_signup_hybrid*"]
+
+[project.scripts]
+gpt-signup-hybrid = "gpt_signup_hybrid.cli:app"

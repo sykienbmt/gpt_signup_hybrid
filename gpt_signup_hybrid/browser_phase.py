@@ -459,8 +459,19 @@ async def _drive_signup_flow(
 
         if screen == "password_login":
             if login_attempted:
-                await asyncio.sleep(1.0)
-                continue
+                # Đã submit password rồi — nếu vẫn còn ở password_login → wrong password
+                # Check error text (nếu có), sau đó raise terminal error ngay
+                err_text = ""
+                try:
+                    err_el = page.locator('[role="alert"], [class*="error"], [class*="alert"]').first
+                    err_text = (await err_el.text_content(timeout=800)) or ""
+                except Exception:
+                    pass
+                # Dù có hay không có error text, stuck ở password_login sau submit = wrong password
+                raise BrowserPhaseError(
+                    f"wrong password — account already exists with different password"
+                    + (f": {err_text.strip()[:80]}" if err_text.strip() else "")
+                )
             log("[flow] login with password")
             pwd_input = None
             for sel in ('input[type="password"]', 'input[name="password"]'):

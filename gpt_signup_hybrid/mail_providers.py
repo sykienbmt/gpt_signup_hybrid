@@ -308,16 +308,22 @@ class OutlookMailProvider:
             self.combo.refresh_token = latest
 
     def _persist_state(self, token_data: dict[str, Any]) -> None:
-        record = {
+        # Merge với state hiện tại để giữ các field không liên quan đến token
+        # (registered_password, last_error, used_for_signup, v.v.)
+        try:
+            existing = json.loads(self.state_path.read_text(encoding="utf-8")) if self.state_path.exists() else {}
+        except (OSError, json.JSONDecodeError):
+            existing = {}
+        existing.update({
             "email": self.combo.email,
             "client_id": self.combo.client_id,
             "refresh_token": self.combo.refresh_token,
             "last_refresh_at": datetime.now(timezone.utc).isoformat(),
             "expires_in": token_data.get("expires_in"),
             "scope": token_data.get("scope"),
-        }
+        })
         tmp = self.state_path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(record, indent=2), encoding="utf-8")
+        tmp.write_text(json.dumps(existing, indent=2), encoding="utf-8")
         tmp.replace(self.state_path)
 
     def _safe_proxy(self) -> str | None:
@@ -333,26 +339,30 @@ class OutlookMailProvider:
                 return f"{scheme}://***@{host}"
         return self.proxy
 
-    def _build_client(self) -> httpx.AsyncClient:
-        """httpx client kèm proxy + timeout chuẩn cho Outlook."""
+    def _build_sync_client(self) -> httpx.Client:
+        """httpx sync client kèm proxy + timeout chuẩn cho Outlook."""
         kwargs: dict[str, Any] = {"timeout": _OUTLOOK_HTTP_TIMEOUT}
         if self.proxy:
             kwargs["proxy"] = self.proxy
-        return httpx.AsyncClient(**kwargs)
+        return httpx.Client(**kwargs)
 
     async def _refresh_access(self, *, log) -> None:
         log(f"[otp:outlook] refreshing access token for {self.combo.email}"
             + (f" via proxy {self._safe_proxy()}" if self.proxy else ""))
-        async with self._build_client() as client:
-            response = await client.post(
-                _TOKEN_URL,
-                data={
-                    "client_id": self.combo.client_id,
-                    "scope": self.scope,
-                    "refresh_token": self.combo.refresh_token,
-                    "grant_type": "refresh_token",
-                },
-            )
+
+        def _sync_refresh():
+            with self._build_sync_client() as client:
+                return client.post(
+                    _TOKEN_URL,
+                    data={
+                        "client_id": self.combo.client_id,
+                        "scope": self.scope,
+                        "refresh_token": self.combo.refresh_token,
+                        "grant_type": "refresh_token",
+                    },
+                )
+
+        response = await asyncio.to_thread(_sync_refresh)
         if response.status_code != 200:
             body = response.text[:500]
             # Phân biệt fatal (combo dead) vs transient (network blip / 5xx)
@@ -385,39 +395,42 @@ class OutlookMailProvider:
     async def _list_messages(
         self,
         *,
-        client: httpx.AsyncClient,
         access_token: str,
         folder_name: str | None,
         top: int = 10,
     ) -> list[dict[str, Any]]:
         """Lấy `top` message mới nhất, optional theo tên folder."""
-        if folder_name is None:
-            url = f"{_GRAPH_BASE}/me/messages"
-        else:
-            # Filter folder by displayName
-            folder_resp = await client.get(
-                f"{_GRAPH_BASE}/me/mailFolders",
-                params={"$filter": f"displayName eq '{folder_name}'"},
-                headers={"Authorization": f"Bearer {access_token}"},
-            )
-            folder_resp.raise_for_status()
-            folders = folder_resp.json().get("value", [])
-            if not folders:
-                return []
-            folder_id = folders[0]["id"]
-            url = f"{_GRAPH_BASE}/me/mailFolders/{folder_id}/messages"
+        def _sync_list():
+            with self._build_sync_client() as client:
+                if folder_name is None:
+                    url = f"{_GRAPH_BASE}/me/messages"
+                else:
+                    # Filter folder by displayName
+                    folder_resp = client.get(
+                        f"{_GRAPH_BASE}/me/mailFolders",
+                        params={"$filter": f"displayName eq '{folder_name}'"},
+                        headers={"Authorization": f"Bearer {access_token}"},
+                    )
+                    folder_resp.raise_for_status()
+                    folders = folder_resp.json().get("value", [])
+                    if not folders:
+                        return []
+                    folder_id = folders[0]["id"]
+                    url = f"{_GRAPH_BASE}/me/mailFolders/{folder_id}/messages"
 
-        resp = await client.get(
-            url,
-            params={
-                "$top": top,
-                "$orderby": "receivedDateTime desc",
-                "$select": "subject,from,receivedDateTime,bodyPreview,body",
-            },
-            headers={"Authorization": f"Bearer {access_token}"},
-        )
-        resp.raise_for_status()
-        return resp.json().get("value", [])
+                resp = client.get(
+                    url,
+                    params={
+                        "$top": top,
+                        "$orderby": "receivedDateTime desc",
+                        "$select": "subject,from,receivedDateTime,bodyPreview,body",
+                    },
+                    headers={"Authorization": f"Bearer {access_token}"},
+                )
+                resp.raise_for_status()
+                return resp.json().get("value", [])
+
+        return await asyncio.to_thread(_sync_list)
 
     async def poll_otp(
         self,
@@ -439,7 +452,8 @@ class OutlookMailProvider:
         log(f"[otp:outlook] polling {self.combo.email} (timeout {timeout_seconds:.0f}s)"
             + (f" via proxy {self._safe_proxy()}" if self.proxy else " direct"))
 
-        async with self._build_client() as client:
+        # _ensure_access() and _list_messages() create and close their own HTTP clients.
+        if True:
             attempt = 0
             consecutive_transient = 0
             while True:
@@ -449,7 +463,7 @@ class OutlookMailProvider:
                     # Strategy: query toàn bộ mailbox (folder=None) để bắt mail dù
                     # ở Inbox, Junk, hoặc folder lạ. Nhanh hơn và tin cậy hơn loop folder.
                     messages = await self._list_messages(
-                        client=client, access_token=access, folder_name=None,
+                        access_token=access, folder_name=None,
                         top=5,
                     )
                     consecutive_transient = 0  # reset khi 1 round thành công
@@ -504,6 +518,99 @@ class OutlookMailProvider:
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Gmail rented provider
+# ─────────────────────────────────────────────────────────────────────
+
+_GMAIL_RENTED_OTP_VALID = re.compile(r"^\d{4,8}$")
+
+
+class GmailRentedComboError(Exception):
+    """Combo Gmail rented parse fail."""
+
+
+class GmailRentedCombo:
+    """Combo format: `email|otp_api_url`.
+
+    otp_api_url — GET → {"otp": "123456", "updated_at": "<ISO timestamp>"}
+    """
+
+    __slots__ = ("email", "otp_api_url")
+
+    def __init__(self, email: str, otp_api_url: str):
+        self.email = email
+        self.otp_api_url = otp_api_url
+
+    @classmethod
+    def parse(cls, line: str) -> "GmailRentedCombo":
+        parts = line.split("|", 1)
+        if len(parts) != 2:
+            raise GmailRentedComboError(
+                f"combo phải có 2 phần (email|otp_api_url), nhận {len(parts)}"
+            )
+        email, otp_api_url = (p.strip() for p in parts)
+        if not email or "@" not in email:
+            raise GmailRentedComboError(f"email không hợp lệ: {email!r}")
+        if not otp_api_url.lower().startswith("http"):
+            raise GmailRentedComboError(f"otp_api_url không hợp lệ: {otp_api_url!r}")
+        return cls(email=email, otp_api_url=otp_api_url)
+
+
+class GmailRentedMailProvider:
+    """Gmail rented email OTP provider.
+
+    GET otp_api_url → {"otp": "123456", "updated_at": "<ISO timestamp>"}
+    Accept nếu updated_at > started_at AND otp khớp \\d{4,8}.
+    """
+
+    def __init__(self, *, combo: GmailRentedCombo):
+        self.combo = combo
+
+    async def poll_otp(
+        self,
+        *,
+        recipient: str,
+        started_at: datetime,
+        timeout_seconds: float,
+        poll_interval_seconds: float,
+        log,
+    ) -> str:
+        deadline = time.monotonic() + max(timeout_seconds, 1.0)
+        log(f"[otp:gmail_rented] polling {self.combo.email} via API (timeout {timeout_seconds:.0f}s)")
+
+        attempt = 0
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+            while True:
+                attempt += 1
+                try:
+                    response = await client.get(
+                        self.combo.otp_api_url,
+                        headers={"Accept": "application/json"},
+                    )
+                    if response.status_code == 200:
+                        data = response.json()
+                        otp = str(data.get("otp") or "").strip()
+                        updated_at = _parse_dt(data.get("updated_at"))
+                        if (
+                            otp
+                            and _GMAIL_RENTED_OTP_VALID.match(otp)
+                            and updated_at is not None
+                            and updated_at > started_at
+                        ):
+                            log(f"[otp:gmail_rented] found {otp} (updated_at={updated_at.isoformat()} attempt {attempt})")
+                            return otp
+                        log(f"[otp:gmail_rented] no fresh OTP (attempt {attempt}): otp={otp!r} updated_at={updated_at}")
+                    else:
+                        log(f"[otp:gmail_rented] HTTP {response.status_code} attempt {attempt}")
+                except (httpx.HTTPError, ValueError) as exc:
+                    log(f"[otp:gmail_rented] error attempt {attempt}: {exc}")
+
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"OTP timeout after {timeout_seconds}s for {self.combo.email}")
+                await asyncio.sleep(min(poll_interval_seconds, remaining))
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Factory
 # ─────────────────────────────────────────────────────────────────────
 
@@ -519,3 +626,8 @@ def build_provider_outlook(
 ) -> OutlookMailProvider:
     parsed = OutlookCombo.parse(combo)
     return OutlookMailProvider(combo=parsed, state_dir=state_dir, proxy=proxy)
+
+
+def build_provider_gmail_rented(*, combo: str) -> GmailRentedMailProvider:
+    parsed = GmailRentedCombo.parse(combo)
+    return GmailRentedMailProvider(combo=parsed)

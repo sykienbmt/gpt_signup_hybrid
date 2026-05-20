@@ -34,8 +34,8 @@ class SignupRequest(BaseModel):
     #   - Outlook combo (Microsoft Graph) — cho mail @hotmail.com / @outlook.com.
     mail_provider: str = Field(
         default="worker",
-        description="Provider: 'worker' hoặc 'outlook'.",
-        pattern="^(worker|outlook)$",
+        description="Provider: 'worker', 'outlook', hoặc 'gmail_rented'.",
+        pattern="^(worker|outlook|gmail_rented)$",
     )
     # Worker config
     email_logs_url: str = Field(
@@ -51,6 +51,11 @@ class SignupRequest(BaseModel):
     outlook_combo: str | None = Field(
         default=None,
         description="Combo `email|password|refresh_token|client_id` (Microsoft Graph).",
+    )
+    # Gmail rented combo config
+    gmail_rented_combo: str | None = Field(
+        default=None,
+        description="Combo `email|otp_api_url` cho Gmail rented.",
     )
     # Polling chung
     otp_timeout_seconds: float = Field(default=180.0, ge=10, description="Thời gian tối đa đợi OTP về.")
@@ -115,6 +120,7 @@ class SignupResult(BaseModel):
     session_token: str | None = Field(default=None, description="__Secure-next-auth.session-token JWT.")
     access_token: str | None = Field(default=None, description="Bearer JWT cho /backend-api/.")
     cookies: list[dict[str, Any]] = Field(default_factory=list, description="Cookies sau callback (chatgpt.com).")
+    auth_session: dict[str, Any] | None = Field(default=None, description="Full /api/auth/session response JSON.")
     phase1_seconds: float = 0.0
     phase2_seconds: float = 0.0
     otp_seconds: float = 0.0

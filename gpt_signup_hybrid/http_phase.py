@@ -194,13 +194,13 @@ def _callback_openai(
     }
 
 
-def _fetch_access_token(
+def _fetch_auth_session(
     *,
     session: curl_requests.Session,
     request: SignupRequest,
     log,
-) -> tuple[str | None, str | None]:
-    """Optional: gọi /api/auth/session để lấy access token + user_id sau callback."""
+) -> dict[str, Any] | None:
+    """Gọi /api/auth/session — trả về full JSON response (accessToken, user, account, expires...)."""
     url = f"{_CHATGPT_BASE}/api/auth/session"
     headers = {
         "User-Agent": request.user_agent,
@@ -211,14 +211,16 @@ def _fetch_access_token(
         response = session.get(url, headers=headers, timeout=30)
         if response.status_code != 200:
             log(f"[http] WARN /api/auth/session HTTP {response.status_code}")
-            return None, None
+            return None
         data = response.json()
-        access = data.get("accessToken")
-        user = data.get("user", {}) or {}
-        return access, user.get("id")
+        if not data.get("accessToken"):
+            log(f"[http] WARN /api/auth/session missing accessToken")
+            return None
+        log(f"[http] /api/auth/session OK user={data.get('user', {}).get('id', '')}")
+        return data
     except Exception as exc:
-        log(f"[http] WARN fetch access_token failed: {exc}")
-        return None, None
+        log(f"[http] WARN fetch auth/session failed: {exc}")
+        return None
 
 
 def _extract_session_from_handoff(handoff: BrowserHandoff) -> dict[str, Any]:
@@ -290,8 +292,10 @@ async def run_http_phase(
                     domain=c.get("domain") or "chatgpt.com",
                     path=c.get("path") or "/",
                 )
-            access_token, user_id = _fetch_access_token(session=session, request=request, log=log)
-            return {**result, "access_token": access_token, "user_id": user_id}
+            auth_session = _fetch_auth_session(session=session, request=request, log=log)
+            access_token = (auth_session or {}).get("accessToken")
+            user_id = ((auth_session or {}).get("user") or {}).get("id")
+            return {**result, "access_token": access_token, "user_id": user_id, "auth_session": auth_session}
         finally:
             try:
                 session.close()
