@@ -126,6 +126,10 @@ async def _get_session_browser(
     )
     ctx = await cf.__aenter__()
     try:
+        # Suppress Playwright Firefox bug: pageError.location undefined crash
+        # (Playwright 1.60 + Camoufox — uncaught JS error thiếu location info)
+        ctx.on("pageerror", lambda _: None)
+
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
 
         # Step 1: bootstrap

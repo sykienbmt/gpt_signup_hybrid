@@ -993,6 +993,9 @@ async def run_browser_phase(
         )
         ctx = await cf.__aenter__()
 
+        # Suppress Playwright Firefox bug: pageError.location undefined crash
+        ctx.on("pageerror", lambda _: None)
+
         # Capture callback URL
         callback_holder: dict[str, str] = {}
 
