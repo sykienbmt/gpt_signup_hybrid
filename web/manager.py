@@ -1,0 +1,968 @@
+"""Job manager: queue + concurrency control + broadcast events."""
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import random
+import time
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from ..config import load_settings, runtime_session_dir
+from ..mail_providers import OutlookCombo, OutlookComboError
+from ..mfa_phase import MfaError, enable_2fa
+from ..models import SignupRequest, SignupResult
+from ..signup import run_signup
+from .mail_modes import MailModeParseError, get_spec
+
+
+# ── Load .env riêng của gpt_signup_hybrid ─────────────────────────────
+def _load_hybrid_env() -> dict[str, str]:
+    """Đọc gpt_signup_hybrid/.env (cùng thư mục package root)."""
+    env_path = Path(__file__).resolve().parent.parent / ".env"
+    values: dict[str, str] = {}
+    if not env_path.exists():
+        return values
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        values[key.strip()] = val.strip().strip("'\"")
+    return values
+
+
+_HYBRID_ENV = _load_hybrid_env()
+
+
+def _env(key: str, default: str) -> str:
+    """Ưu tiên: os.environ > .env file > default."""
+    return os.environ.get(key) or _HYBRID_ENV.get(key) or default
+
+
+# Parsed constants
+_MAX_CONCURRENT = min(max(int(_env("HYBRID_MAX_CONCURRENT", "2")), 1), 10)
+_DEFAULT_JOB_TIMEOUT = min(max(float(_env("HYBRID_JOB_TIMEOUT", "240")), 30), 600)
+_DEFAULT_PROXY = _env("HYBRID_OUTLOOK_PROXY", "") or None
+
+
+JobStatus = str  # queued | running | success | error | cancelled
+
+
+@dataclass
+class Job:
+    id: str
+    email: str
+    combo: str  # raw combo line
+    mail_mode: str = "outlook"
+    status: JobStatus = "queued"
+    log_lines: list[str] = field(default_factory=list)
+    error: str | None = None
+    # Output sau khi success
+    password: str | None = None
+    secret: str | None = None
+    first_code: str | None = None
+    user_id: str | None = None
+    session_path: str | None = None
+    created_at: float = field(default_factory=time.time)
+    started_at: float | None = None
+    finished_at: float | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "email": self.email,
+            "mail_mode": self.mail_mode,
+            "status": self.status,
+            "error": self.error,
+            "password": self.password,
+            "secret": self.secret,
+            "first_code": self.first_code,
+            "user_id": self.user_id,
+            "session_path": self.session_path,
+            "created_at": self.created_at,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "duration": (
+                (self.finished_at or time.time()) - self.started_at if self.started_at else None
+            ),
+            "log_count": len(self.log_lines),
+        }
+
+    def to_dict_full(self) -> dict[str, Any]:
+        d = self.to_dict()
+        d["log_lines"] = list(self.log_lines)
+        return d
+
+
+class JobManager:
+    """Quản lý jobs + concurrency thông qua worker pool pattern.
+
+    Thay vì spawn task riêng cho mỗi job (race condition khi thay đổi
+    max_concurrent giữa chừng), dùng N worker coroutine lấy job từ queue.
+    Khi thay đổi max_concurrent → scale worker pool lên/xuống.
+    """
+
+    def __init__(self, *, max_concurrent: int = 1):
+        self.jobs: dict[str, Job] = {}
+        self.order: list[str] = []  # giữ thứ tự tạo
+        self._max = max_concurrent
+        self._headless = True
+        self._debug = False
+        self._job_timeout = _DEFAULT_JOB_TIMEOUT
+        self._proxy: str | None = _DEFAULT_PROXY
+        self._tasks: dict[str, asyncio.Task] = {}  # job_id → running task (for cancel)
+        self._subscribers: set[asyncio.Queue] = set()
+        # Worker pool
+        self._job_queue: asyncio.Queue[str] = asyncio.Queue()
+        self._workers: list[asyncio.Task] = []
+        self._worker_started = False
+        # Stagger: tránh nhiều browser khởi tạo cùng 1 lúc → random 5-10s giữa các start
+        self._stagger_lock = asyncio.Lock()
+        self._last_start_ts: float = 0.0
+        self._stagger_min_seconds = 5.0
+        self._stagger_max_seconds = 10.0
+
+    def _ensure_workers(self) -> None:
+        """Đảm bảo đủ worker theo max_concurrent. Gọi mỗi khi thêm job hoặc đổi config."""
+        if not self._worker_started:
+            self._worker_started = True
+        # Scale lên nếu cần thêm worker
+        while len(self._workers) < self._max:
+            w = asyncio.create_task(self._worker_loop())
+            self._workers.append(w)
+        # Scale xuống: cancel worker thừa (chúng sẽ tự exit khi bị cancel ở chỗ queue.get)
+        while len(self._workers) > self._max:
+            w = self._workers.pop()
+            w.cancel()
+
+    async def _worker_loop(self) -> None:
+        """Worker lấy job từ queue, chạy tuần tự từng cái một.
+
+        Stagger: trước mỗi start, đợi tới ít nhất `_stagger_min_seconds` sau lần
+        start gần nhất + random jitter — tránh spawn nhiều browser cùng tick.
+        """
+        try:
+            while True:
+                job_id = await self._job_queue.get()
+                job = self.jobs.get(job_id)
+                if job is None or job.status != "queued":
+                    continue  # job đã bị remove/cancel trước khi tới lượt
+                # Stagger start nếu max_concurrent > 1 (single mode không cần)
+                if self._max > 1:
+                    async with self._stagger_lock:
+                        now = time.monotonic()
+                        wait_min = self._last_start_ts + self._stagger_min_seconds - now
+                        if wait_min > 0:
+                            jitter = random.uniform(
+                                self._stagger_min_seconds, self._stagger_max_seconds,
+                            )
+                            wait = max(wait_min, jitter)
+                            self._job_log(job, f"[stagger] đợi {wait:.1f}s trước khi start")
+                            await asyncio.sleep(wait)
+                        self._last_start_ts = time.monotonic()
+                await self._run_job_with_timeout(job)
+        except asyncio.CancelledError:
+            pass
+
+    @property
+    def max_concurrent(self) -> int:
+        return self._max
+
+    def set_max_concurrent(self, n: int) -> None:
+        if n < 1 or n > _MAX_CONCURRENT:
+            raise ValueError(f"max_concurrent phải trong [1, {_MAX_CONCURRENT}]")
+        self._max = n
+        self._ensure_workers()
+
+    @property
+    def headless(self) -> bool:
+        return self._headless
+
+    def set_headless(self, value: bool) -> None:
+        self._headless = bool(value)
+
+    @property
+    def debug(self) -> bool:
+        return self._debug
+
+    def set_debug(self, value: bool) -> None:
+        self._debug = bool(value)
+
+    @property
+    def job_timeout(self) -> float:
+        return self._job_timeout
+
+    def set_job_timeout(self, seconds: float) -> None:
+        if seconds < 30 or seconds > 600:
+            raise ValueError("job_timeout phải trong [30, 600]")
+        self._job_timeout = float(seconds)
+
+    @property
+    def proxy(self) -> str | None:
+        return self._proxy
+
+    def set_proxy(self, value: str | None) -> None:
+        """Set proxy chung cho tất cả jobs sau này. None/'' = direct."""
+        if value is None:
+            self._proxy = None
+            return
+        v = str(value).strip()
+        self._proxy = v or None
+
+    def subscribe(self) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue(maxsize=500)
+        self._subscribers.add(q)
+        return q
+
+    def unsubscribe(self, q: asyncio.Queue) -> None:
+        self._subscribers.discard(q)
+
+    def _broadcast(self, event: dict[str, Any]) -> None:
+        for q in list(self._subscribers):
+            try:
+                q.put_nowait(event)
+            except asyncio.QueueFull:
+                # drop event nếu queue đầy (subscriber chậm)
+                pass
+
+    def _job_log(self, job: Job, msg: str) -> None:
+        ts = datetime.now().strftime("%H:%M:%S")
+        line = f"[{ts}] {msg}"
+        job.log_lines.append(line)
+        if len(job.log_lines) > 500:
+            job.log_lines = job.log_lines[-500:]
+        self._broadcast({"type": "log", "job_id": job.id, "line": line})
+
+    def _broadcast_job(self, job: Job) -> None:
+        self._broadcast({"type": "job", "job": job.to_dict()})
+
+    def _safe_proxy_log(self) -> str:
+        """Trả URL proxy đã ẩn user:pass cho log."""
+        p = self._proxy
+        if not p:
+            return "direct"
+        if "@" in p:
+            scheme_split = p.split("://", 1)
+            if len(scheme_split) == 2:
+                scheme, rest = scheme_split
+                _, _, host = rest.partition("@")
+                return f"{scheme}://***@{host}"
+        return p
+
+    def add_jobs(self, combos: list[str], *, default_password: str | None = None, mail_mode: str = "outlook", worker_config: dict[str, str] | None = None) -> list[Job]:
+        """Thêm jobs từ list combo/email strings. Skip đã có trong list (dedup theo email)."""
+        spec = get_spec(mail_mode)  # KeyError nếu mode lạ — server chặn trước
+        existing_emails = {j.email.lower() for j in self.jobs.values() if j.status != "cancelled"}
+        out: list[Job] = []
+        for raw in combos:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            try:
+                parsed = spec.parse_line(line)
+            except (OutlookComboError, MailModeParseError) as exc:
+                jid = uuid.uuid4().hex[:12]
+                job = Job(
+                    id=jid,
+                    email="<invalid>",
+                    combo=line[:80],
+                    mail_mode=spec.id,
+                    status="error",
+                    error=f"parse fail: {exc}",
+                    finished_at=time.time(),
+                )
+                self.jobs[jid] = job
+                self.order.append(jid)
+                self._broadcast_job(job)
+                out.append(job)
+                continue
+
+            if parsed.email.lower() in existing_emails:
+                continue  # dedup
+            existing_emails.add(parsed.email.lower())
+
+            jid = uuid.uuid4().hex[:12]
+            job = Job(id=jid, email=parsed.email, combo=line, mail_mode=spec.id)
+            job._default_password = default_password  # type: ignore[attr-defined]
+            job._worker_config = worker_config  # type: ignore[attr-defined]
+            self.jobs[jid] = job
+            self.order.append(jid)
+            self._broadcast_job(job)
+            out.append(job)
+        # Enqueue jobs → workers sẽ pick lên theo thứ tự
+        self._ensure_workers()
+        for j in out:
+            if j.status == "queued":
+                self._job_queue.put_nowait(j.id)
+        return out
+
+    def remove_job(self, job_id: str) -> bool:
+        job = self.jobs.get(job_id)
+        if job is None:
+            return False
+        # Cancel task nếu đang chạy
+        task = self._tasks.get(job_id)
+        if task and not task.done():
+            task.cancel()
+            job.status = "cancelled"
+            job.finished_at = time.time()
+        # Cleanup references
+        self.jobs.pop(job_id, None)
+        if job_id in self.order:
+            self.order.remove(job_id)
+        self._tasks.pop(job_id, None)
+        self._broadcast({"type": "remove", "job_id": job_id})
+        return True
+
+    def stop_all(self) -> int:
+        """Cancel tất cả jobs đang running/queued. Return số job đã cancel."""
+        # Drain queue trước — tránh worker pick job mới
+        while not self._job_queue.empty():
+            try:
+                self._job_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        count = 0
+        for job_id, job in list(self.jobs.items()):
+            if job.status in ("running", "queued"):
+                task = self._tasks.get(job_id)
+                if task and not task.done():
+                    task.cancel()
+                job.status = "cancelled"
+                job.finished_at = time.time()
+                self._broadcast_job(job)
+                count += 1
+        return count
+
+    def clear_finished(self) -> int:
+        """Xoá tất cả jobs đã xong (success/error/cancelled) khỏi memory. Giữ running/queued."""
+        removed = 0
+        for jid in list(self.order):
+            job = self.jobs.get(jid)
+            if job and job.status in ("success", "error", "cancelled"):
+                self.jobs.pop(jid, None)
+                self.order.remove(jid)
+                self._tasks.pop(jid, None)
+                removed += 1
+        if removed:
+            self._broadcast({"type": "clear_finished", "removed": removed})
+        return removed
+
+    def retry_job(self, job_id: str) -> bool:
+        job = self.jobs.get(job_id)
+        if job is None:
+            return False
+        # Cancel task hiện tại nếu running
+        task = self._tasks.get(job_id)
+        if task and not task.done():
+            task.cancel()
+
+        # Nếu signup đã thành công (có session_path) nhưng 2FA fail,
+        # retry chỉ Phase 2 — không signup lại (tránh trigger login flow + duplicate).
+        retry_2fa_only = bool(job.session_path and not job.secret)
+
+        # Reset state — giữ password đã gen (không gen lại khi retry)
+        job.status = "queued"
+        job.error = None
+        job.secret = None
+        job.first_code = None
+        # KHÔNG reset job.password — dùng lại password đã gen ban đầu
+        if not retry_2fa_only:
+            job.user_id = None
+            job.session_path = None
+        job.started_at = None
+        job.finished_at = None
+        retry_label = "retry-2fa" if retry_2fa_only else "retry"
+        job.log_lines.append(f"[{datetime.now():%H:%M:%S}] -- {retry_label} --")
+        self._broadcast_job(job)
+        self._broadcast({"type": "log", "job_id": job_id, "line": job.log_lines[-1]})
+        # Mark để worker biết cần chạy 2fa-only
+        job._retry_2fa_only = retry_2fa_only  # type: ignore[attr-defined]
+        self._ensure_workers()
+        self._job_queue.put_nowait(job_id)
+        return True
+
+    def list_jobs(self) -> list[dict[str, Any]]:
+        return [self.jobs[jid].to_dict() for jid in self.order if jid in self.jobs]
+
+    def get_job(self, job_id: str) -> dict[str, Any] | None:
+        job = self.jobs.get(job_id)
+        return job.to_dict_full() if job else None
+
+    def get_log(self, job_id: str) -> list[str]:
+        job = self.jobs.get(job_id)
+        return list(job.log_lines) if job else []
+
+    def _spawn(self, job: Job) -> None:
+        """Legacy: chỉ dùng cho internal retry trực tiếp (không qua queue)."""
+        task = asyncio.create_task(self._run_job_with_timeout(job))
+        self._tasks[job.id] = task
+
+    async def _run_job_with_timeout(self, job: Job) -> None:
+        """Wrap _run_job với timeout. Kill nếu vượt job_timeout."""
+        # Track task để có thể cancel từ bên ngoài
+        self._tasks[job.id] = asyncio.current_task()  # type: ignore[arg-type]
+        try:
+            # Kiểm tra nếu là retry-2fa-only
+            retry_2fa_only = getattr(job, '_retry_2fa_only', False)
+            if hasattr(job, '_retry_2fa_only'):
+                del job._retry_2fa_only  # type: ignore[attr-defined]
+
+            # Debug mode + headed → không timeout (chờ user cancel)
+            timeout = None if (self._debug and not self._headless) else self._job_timeout
+
+            if retry_2fa_only:
+                await asyncio.wait_for(self._run_2fa_only_inner(job), timeout=timeout)
+            else:
+                await asyncio.wait_for(self._run_job(job), timeout=timeout)
+        except asyncio.TimeoutError:
+            job.status = "error"
+            job.error = f"timeout {self._job_timeout:.0f}s exceeded — killed"
+            job.finished_at = time.time()
+            self._job_log(job, f"[fatal] job timeout {self._job_timeout:.0f}s — killed")
+            self._broadcast_job(job)
+        except asyncio.CancelledError:
+            job.status = "cancelled"
+            job.finished_at = time.time()
+            self._broadcast_job(job)
+            raise
+        finally:
+            self._tasks.pop(job.id, None)
+
+    def _spawn_2fa_only(self, job: Job) -> None:
+        """Legacy — không dùng trực tiếp nữa, retry qua queue."""
+        job._retry_2fa_only = True  # type: ignore[attr-defined]
+        self._ensure_workers()
+        self._job_queue.put_nowait(job.id)
+
+    async def _run_2fa_only_inner(self, job: Job) -> None:
+        """Chạy Phase 2 (enable 2FA) khi signup đã có session_path."""
+        try:
+            if job.id not in self.jobs:
+                return
+            job.status = "running"
+            job.started_at = time.time()
+            self._broadcast_job(job)
+
+            def log(msg: str) -> None:
+                self._job_log(job, msg)
+
+            # Đọc access_token từ session.json đã save
+            if not job.session_path or not Path(job.session_path).exists():
+                job.status = "error"
+                job.error = "session file mất, không retry 2FA được"
+                job.finished_at = time.time()
+                self._broadcast_job(job)
+                return
+
+            try:
+                sdata = json.loads(Path(job.session_path).read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                job.status = "error"
+                job.error = f"session file corrupt: {exc}"
+                job.finished_at = time.time()
+                self._broadcast_job(job)
+                return
+
+            access_token = sdata.get("access_token")
+            if not access_token:
+                job.status = "error"
+                job.error = "session file thiếu access_token"
+                job.finished_at = time.time()
+                self._broadcast_job(job)
+                return
+
+            log("[2fa] retry-only: dùng session đã có")
+            try:
+                mfa_result = await enable_2fa(
+                    access_token=access_token,
+                    cookies=sdata.get("cookies"),
+                    log=log,
+                )
+            except MfaError as exc:
+                job.status = "error"
+                job.error = f"2fa: {exc}"
+                job.finished_at = time.time()
+                self._broadcast_job(job)
+                return
+
+            two_fa_path = Path(job.session_path).with_suffix(".2fa.json")
+            two_fa_path.write_text(
+                json.dumps({
+                    "email": job.email,
+                    "user_id": job.user_id,
+                    "two_factor": mfa_result,
+                }, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            job.secret = mfa_result.get("secret")
+            job.first_code = mfa_result.get("first_code")
+            job.status = "success"
+            job.finished_at = time.time()
+            self._broadcast_job(job)
+
+        except asyncio.CancelledError:
+            job.status = "cancelled"
+            job.finished_at = time.time()
+            self._broadcast_job(job)
+            raise
+        except Exception as exc:
+            job.status = "error"
+            job.error = f"{type(exc).__name__}: {exc}"
+            job.finished_at = time.time()
+            self._job_log(job, f"[fatal] {job.error}")
+            self._broadcast_job(job)
+
+    async def _run_job(self, job: Job) -> None:
+        try:
+            if job.id not in self.jobs:
+                return  # đã bị remove trước khi tới lượt
+            job.status = "running"
+            job.started_at = time.time()
+            self._broadcast_job(job)
+
+            def log(msg: str) -> None:
+                self._job_log(job, msg)
+
+            log(f"[mode] {job.mail_mode}")
+            if self._proxy:
+                log(f"[proxy] using {self._safe_proxy_log()}")
+
+            # Build SignupRequest qua registry spec
+            spec = get_spec(job.mail_mode)
+            parsed = spec.parse_line(job.combo)
+            request = spec.build_request(
+                parsed,
+                worker_config=getattr(job, '_worker_config', None),
+                password=job.password or getattr(job, '_default_password', None),
+                headless=self._headless,
+                keep_browser_open=self._debug and not self._headless,
+                proxy=self._proxy,
+            )
+            result: SignupResult = await run_signup(request, log=log)
+
+            if not result.success:
+                job.status = "error"
+                job.error = result.error or "signup failed"
+                job.finished_at = time.time()
+                self._broadcast_job(job)
+                return
+
+            # Lưu session JSON
+            settings = load_settings()
+            session_path = (
+                runtime_session_dir(settings)
+                / f"signup-{datetime.now():%Y%m%d-%H%M%S}-{job.email.replace('@', '_at_')}.json"
+            )
+            session_path.write_text(
+                json.dumps(result.model_dump(), indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            job.session_path = str(session_path)
+            job.user_id = result.user_id
+            job.password = result.password
+
+            # Phase 2: enable 2FA
+            log("[2fa] enabling…")
+            if not result.access_token:
+                job.status = "error"
+                job.error = "missing access_token, không thể enable 2FA"
+                job.finished_at = time.time()
+                self._broadcast_job(job)
+                return
+
+            try:
+                mfa_result = await enable_2fa(
+                    access_token=result.access_token,
+                    cookies=result.cookies,
+                    log=log,
+                )
+            except MfaError as exc:
+                job.status = "error"
+                job.error = f"2fa: {exc}"
+                job.finished_at = time.time()
+                self._broadcast_job(job)
+                return
+
+            # Lưu .2fa.json kèm
+            two_fa_path = session_path.with_suffix(".2fa.json")
+            two_fa_path.write_text(
+                json.dumps({
+                    "email": job.email,
+                    "user_id": job.user_id,
+                    "two_factor": mfa_result,
+                }, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            job.secret = mfa_result.get("secret")
+            job.first_code = mfa_result.get("first_code")
+            job.status = "success"
+            job.finished_at = time.time()
+            self._broadcast_job(job)
+
+        except asyncio.CancelledError:
+            job.status = "cancelled"
+            job.finished_at = time.time()
+            self._broadcast_job(job)
+            raise
+        except Exception as exc:
+            job.status = "error"
+            job.error = f"{type(exc).__name__}: {exc}"
+            job.finished_at = time.time()
+            self._job_log(job, f"[fatal] {job.error}")
+            self._broadcast_job(job)
+
+
+# Singleton
+_manager: JobManager | None = None
+
+
+def get_manager() -> JobManager:
+    global _manager
+    if _manager is None:
+        _manager = JobManager(max_concurrent=1)
+    return _manager
+
+
+# ─────────────────────────────────────────────────────────────────────
+# SessionJobManager — Get Session feature
+# ─────────────────────────────────────────────────────────────────────
+
+from ..session_phase import SessionError, get_session  # noqa: E402
+
+
+@dataclass
+class SessionJob:
+    id: str
+    email: str
+    password: str
+    secret: str | None = None
+    status: JobStatus = "queued"
+    log_lines: list[str] = field(default_factory=list)
+    error: str | None = None
+    session_data: dict[str, Any] | None = None  # full /api/auth/session JSON
+    created_at: float = field(default_factory=time.time)
+    started_at: float | None = None
+    finished_at: float | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "email": self.email,
+            "status": self.status,
+            "error": self.error,
+            "has_session": self.session_data is not None,
+            "created_at": self.created_at,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "duration": (
+                (self.finished_at or time.time()) - self.started_at if self.started_at else None
+            ),
+            "log_count": len(self.log_lines),
+        }
+
+    def to_dict_full(self) -> dict[str, Any]:
+        d = self.to_dict()
+        d["log_lines"] = list(self.log_lines)
+        d["session_data"] = self.session_data
+        return d
+
+
+class SessionJobManager:
+    """Quản lý Get Session jobs — worker pool pattern tương tự JobManager."""
+
+    def __init__(self, *, max_concurrent: int = 1):
+        self.jobs: dict[str, SessionJob] = {}
+        self.order: list[str] = []
+        self._max = max_concurrent
+        self._headless = True
+        self._job_timeout = _DEFAULT_JOB_TIMEOUT
+        self._tasks: dict[str, asyncio.Task] = {}
+        self._subscribers: set[asyncio.Queue] = set()
+        self._job_queue: asyncio.Queue[str] = asyncio.Queue()
+        self._workers: list[asyncio.Task] = []
+        self._worker_started = False
+        # Stagger: random 5-10s giữa các start
+        self._stagger_lock = asyncio.Lock()
+        self._last_start_ts: float = 0.0
+        self._stagger_min_seconds = 5.0
+        self._stagger_max_seconds = 10.0
+
+    @property
+    def headless(self) -> bool:
+        return self._headless
+
+    def set_headless(self, value: bool) -> None:
+        self._headless = bool(value)
+
+    def _ensure_workers(self) -> None:
+        if not self._worker_started:
+            self._worker_started = True
+        while len(self._workers) < self._max:
+            w = asyncio.create_task(self._worker_loop())
+            self._workers.append(w)
+        while len(self._workers) > self._max:
+            w = self._workers.pop()
+            w.cancel()
+
+    async def _worker_loop(self) -> None:
+        try:
+            while True:
+                job_id = await self._job_queue.get()
+                job = self.jobs.get(job_id)
+                if job is None or job.status != "queued":
+                    continue
+                # Stagger start nếu max_concurrent > 1
+                if self._max > 1:
+                    async with self._stagger_lock:
+                        now = time.monotonic()
+                        wait_min = self._last_start_ts + self._stagger_min_seconds - now
+                        if wait_min > 0:
+                            jitter = random.uniform(
+                                self._stagger_min_seconds, self._stagger_max_seconds,
+                            )
+                            wait = max(wait_min, jitter)
+                            self._job_log(job, f"[stagger] đợi {wait:.1f}s trước khi start")
+                            await asyncio.sleep(wait)
+                        self._last_start_ts = time.monotonic()
+                await self._run_job(job)
+        except asyncio.CancelledError:
+            pass
+
+    @property
+    def max_concurrent(self) -> int:
+        return self._max
+
+    def set_max_concurrent(self, n: int) -> None:
+        if n < 1 or n > _MAX_CONCURRENT:
+            raise ValueError(f"max_concurrent phải trong [1, {_MAX_CONCURRENT}]")
+        self._max = n
+        self._ensure_workers()
+
+    @property
+    def job_timeout(self) -> float:
+        return self._job_timeout
+
+    def set_job_timeout(self, seconds: float) -> None:
+        if seconds < 30 or seconds > 600:
+            raise ValueError("job_timeout phải trong [30, 600]")
+        self._job_timeout = float(seconds)
+
+    def subscribe(self) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue(maxsize=500)
+        self._subscribers.add(q)
+        return q
+
+    def unsubscribe(self, q: asyncio.Queue) -> None:
+        self._subscribers.discard(q)
+
+    def _broadcast(self, event: dict[str, Any]) -> None:
+        for q in list(self._subscribers):
+            try:
+                q.put_nowait(event)
+            except asyncio.QueueFull:
+                pass
+
+    def _job_log(self, job: SessionJob, msg: str) -> None:
+        ts = datetime.now().strftime("%H:%M:%S")
+        line = f"[{ts}] {msg}"
+        job.log_lines.append(line)
+        if len(job.log_lines) > 500:
+            job.log_lines = job.log_lines[-500:]
+        self._broadcast({"type": "log", "job_id": job.id, "line": line})
+
+    def _broadcast_job(self, job: SessionJob) -> None:
+        self._broadcast({"type": "job", "job": job.to_dict()})
+
+    def add_jobs(self, combos: list[str]) -> list[SessionJob]:
+        """Parse input lines: email|password|secret. Dedup theo email."""
+        existing_emails = {j.email.lower() for j in self.jobs.values() if j.status != "cancelled"}
+        out: list[SessionJob] = []
+        for raw in combos:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("|")
+            if len(parts) < 2:
+                jid = uuid.uuid4().hex[:12]
+                job = SessionJob(
+                    id=jid, email="<invalid>", password="",
+                    status="error", error=f"format sai, cần email|password|secret: {line[:60]}",
+                    finished_at=time.time(),
+                )
+                self.jobs[jid] = job
+                self.order.append(jid)
+                self._broadcast_job(job)
+                out.append(job)
+                continue
+
+            email = parts[0].strip()
+            password = parts[1].strip()
+            secret = parts[2].strip() if len(parts) >= 3 else None
+
+            if email.lower() in existing_emails:
+                continue
+            existing_emails.add(email.lower())
+
+            jid = uuid.uuid4().hex[:12]
+            job = SessionJob(id=jid, email=email, password=password, secret=secret)
+            self.jobs[jid] = job
+            self.order.append(jid)
+            self._broadcast_job(job)
+            out.append(job)
+
+        self._ensure_workers()
+        for j in out:
+            if j.status == "queued":
+                self._job_queue.put_nowait(j.id)
+        return out
+
+    def stop_all(self) -> int:
+        while not self._job_queue.empty():
+            try:
+                self._job_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        count = 0
+        for job_id, job in list(self.jobs.items()):
+            if job.status in ("running", "queued"):
+                task = self._tasks.get(job_id)
+                if task and not task.done():
+                    task.cancel()
+                job.status = "cancelled"
+                job.finished_at = time.time()
+                self._broadcast_job(job)
+                count += 1
+        return count
+
+    def clear_finished(self) -> int:
+        removed = 0
+        for jid in list(self.order):
+            job = self.jobs.get(jid)
+            if job and job.status in ("success", "error", "cancelled"):
+                self.jobs.pop(jid, None)
+                self.order.remove(jid)
+                self._tasks.pop(jid, None)
+                removed += 1
+        if removed:
+            self._broadcast({"type": "clear_finished", "removed": removed})
+        return removed
+
+    def remove_job(self, job_id: str) -> bool:
+        job = self.jobs.get(job_id)
+        if job is None:
+            return False
+        task = self._tasks.get(job_id)
+        if task and not task.done():
+            task.cancel()
+            job.status = "cancelled"
+            job.finished_at = time.time()
+        self.jobs.pop(job_id, None)
+        if job_id in self.order:
+            self.order.remove(job_id)
+        self._tasks.pop(job_id, None)
+        self._broadcast({"type": "remove", "job_id": job_id})
+        return True
+
+    def retry_job(self, job_id: str) -> bool:
+        job = self.jobs.get(job_id)
+        if job is None:
+            return False
+        task = self._tasks.get(job_id)
+        if task and not task.done():
+            task.cancel()
+        job.status = "queued"
+        job.error = None
+        job.session_data = None
+        job.started_at = None
+        job.finished_at = None
+        job.log_lines.append(f"[{datetime.now():%H:%M:%S}] -- retry --")
+        self._broadcast_job(job)
+        self._ensure_workers()
+        self._job_queue.put_nowait(job_id)
+        return True
+
+    def list_jobs(self) -> list[dict[str, Any]]:
+        return [self.jobs[jid].to_dict() for jid in self.order if jid in self.jobs]
+
+    def get_job(self, job_id: str) -> dict[str, Any] | None:
+        job = self.jobs.get(job_id)
+        return job.to_dict_full() if job else None
+
+    def get_log(self, job_id: str) -> list[str]:
+        job = self.jobs.get(job_id)
+        return list(job.log_lines) if job else []
+
+    async def _run_job(self, job: SessionJob) -> None:
+        self._tasks[job.id] = asyncio.current_task()  # type: ignore[arg-type]
+        try:
+            if job.id not in self.jobs:
+                return
+            job.status = "running"
+            job.started_at = time.time()
+            self._broadcast_job(job)
+
+            def log(msg: str) -> None:
+                self._job_log(job, msg)
+
+            session_data = await asyncio.wait_for(
+                get_session(
+                    email=job.email,
+                    password=job.password,
+                    secret=job.secret,
+                    headless=self._headless,
+                    log=log,
+                ),
+                timeout=self._job_timeout,
+            )
+
+            job.session_data = session_data
+            job.status = "success"
+            job.finished_at = time.time()
+            self._broadcast_job(job)
+
+        except asyncio.TimeoutError:
+            job.status = "error"
+            job.error = f"timeout {self._job_timeout:.0f}s exceeded"
+            job.finished_at = time.time()
+            self._job_log(job, f"[fatal] timeout {self._job_timeout:.0f}s")
+            self._broadcast_job(job)
+        except asyncio.CancelledError:
+            job.status = "cancelled"
+            job.finished_at = time.time()
+            self._broadcast_job(job)
+            raise
+        except SessionError as exc:
+            job.status = "error"
+            job.error = str(exc)
+            job.finished_at = time.time()
+            self._job_log(job, f"[error] {exc}")
+            self._broadcast_job(job)
+        except Exception as exc:
+            job.status = "error"
+            job.error = f"{type(exc).__name__}: {exc}"
+            job.finished_at = time.time()
+            self._job_log(job, f"[fatal] {job.error}")
+            self._broadcast_job(job)
+        finally:
+            self._tasks.pop(job.id, None)
+
+
+# Singleton
+_session_manager: SessionJobManager | None = None
+
+
+def get_session_manager() -> SessionJobManager:
+    global _session_manager
+    if _session_manager is None:
+        _session_manager = SessionJobManager(max_concurrent=1)
+    return _session_manager

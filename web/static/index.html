@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>gpt_signup_hybrid · Tool</title>
+<link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-dot"></span>
+    <span class="brand-name">gpt_signup_hybrid</span>
+    <span class="brand-tag">Outlook batch signup + 2FA</span>
+  </div>
+  <nav class="tab-nav">
+    <button class="tab-btn active" data-tab="reg">Reg</button>
+    <button class="tab-btn" data-tab="session">Get Session</button>
+  </nav>
+  <div class="topbar-actions">
+    <label class="select-wrap">
+      <span>Mode</span>
+      <select id="mode">
+        <option value="single">Single (1 job/lần)</option>
+        <option value="multi">Multi (2 song song)</option>
+      </select>
+    </label>
+    <label class="toggle-wrap" title="Bật để ẩn cửa sổ trình duyệt khi chạy">
+      <input type="checkbox" id="headless-toggle" checked />
+      <span class="toggle-track"><span class="toggle-thumb"></span></span>
+      <span class="toggle-label">Headless</span>
+    </label>
+    <label class="toggle-wrap" title="Giữ browser mở sau khi job xong (chỉ khi headed)">
+      <input type="checkbox" id="debug-toggle" />
+      <span class="toggle-track"><span class="toggle-thumb"></span></span>
+      <span class="toggle-label">Debug</span>
+    </label>
+    <span id="status-pill" class="pill pill-idle">idle</span>
+  </div>
+</header>
+
+<!-- ════════════════ PROXY STRIP (global) ════════════════ -->
+<section class="proxy-strip" id="proxy-strip">
+  <div class="proxy-strip-inner">
+    <label class="proxy-input-group">
+      <span class="proxy-icon" aria-hidden="true">🌐</span>
+      <input
+        type="text"
+        id="proxy-input"
+        placeholder="http://user:pass@host:port  ·  để trống = direct"
+        spellcheck="false"
+        autocomplete="off"
+      />
+    </label>
+    <button id="btn-proxy-test" class="btn btn-ghost btn-small" type="button">Test</button>
+    <button id="btn-proxy-save" class="btn btn-ghost btn-small" type="button">Save</button>
+    <span id="proxy-status" class="proxy-status proxy-status-idle">
+      <span class="proxy-dot"></span>
+      <span class="proxy-status-label">direct</span>
+    </span>
+    <span id="proxy-status-detail" class="proxy-status-detail muted"></span>
+  </div>
+</section>
+
+<!-- ════════════════ TAB: REG ════════════════ -->
+<main class="grid tab-content active" id="tab-reg">
+  <section class="card card-input">
+    <header class="card-head">
+      <h2>Input combo</h2>
+      <span class="muted" id="input-hint">Mỗi dòng 1 combo: email|password|refresh_token|client_id</span>
+    </header>
+    <!-- Mail Mode + Worker config: 1 row, label trên / control dưới -->
+    <div class="mail-mode-row">
+      <label class="input-group config-field-mode">
+        <span class="input-label">Mail Mode</span>
+        <select id="mail-mode-select"></select>
+      </label>
+      <div id="mail-mode-config-host" class="mail-mode-config-host"></div>
+    </div>
+    <textarea id="combo-input" placeholder="email1@hotmail.com|pwd1|M.C548...|9e5f94bc-...&#10;email2@outlook.com|pwd2|M.C525...|9e5f94bc-..."></textarea>
+    <div class="card-settings">
+      <div class="card-settings-row">
+        <label class="input-group config-field-long">
+          <span class="input-label">Password mặc định</span>
+          <input type="text" id="default-password" placeholder="Để trống = random" autocomplete="off" spellcheck="false" />
+        </label>
+        <label class="input-group config-field-short">
+          <span class="input-label">Timeout (s/job)</span>
+          <input type="number" id="job-timeout" value="240" min="30" max="600" step="10" />
+        </label>
+      </div>
+    </div>
+    <div class="card-actions">
+      <button id="btn-run" class="btn btn-primary">▶ Chạy</button>
+      <button id="btn-stop-all" class="btn btn-danger">■ Stop All</button>
+      <button id="btn-clear-input" class="btn btn-ghost">Clear input</button>
+      <span class="muted" id="combo-count">0 combo</span>
+    </div>
+  </section>
+
+  <section class="card card-jobs">
+    <header class="card-head">
+      <h2>Jobs</h2>
+      <div style="display:flex; gap:8px; align-items:center">
+        <button id="btn-clear-done" class="btn btn-ghost btn-small" title="Xoá jobs đã xong khỏi RAM">Clear done</button>
+        <span class="muted" id="job-summary">0 total</span>
+      </div>
+    </header>
+    <div id="job-list" class="job-list">
+      <div class="empty">Chưa có job. Paste combo + bấm Chạy.</div>
+    </div>
+  </section>
+
+  <section class="card card-log">
+    <header class="card-head">
+      <h2>Log</h2>
+      <span class="muted" id="log-target">—</span>
+    </header>
+    <pre id="log-pane" class="log-pane"></pre>
+  </section>
+
+  <section class="card card-success">
+    <header class="card-head">
+      <h2>Success output</h2>
+      <button id="btn-copy-success" class="btn btn-ghost btn-small">Copy all</button>
+    </header>
+    <pre id="success-pane" class="output-pane">Format: email|password|secret_2fa</pre>
+  </section>
+
+  <section class="card card-error">
+    <header class="card-head">
+      <h2>Error output</h2>
+      <button id="btn-copy-error" class="btn btn-ghost btn-small">Copy all</button>
+    </header>
+    <pre id="error-pane" class="output-pane">Chưa có lỗi.</pre>
+  </section>
+</main>
+
+<!-- ════════════════ TAB: GET SESSION ════════════════ -->
+<main class="grid tab-content" id="tab-session">
+  <section class="card card-input">
+    <header class="card-head">
+      <h2>Input</h2>
+      <span class="muted">Mỗi dòng: email|password|2fa_secret</span>
+    </header>
+    <textarea id="ses-combo-input" placeholder="email@hotmail.com|password123|DNPARKKMM5EYOPDG...&#10;email2@hotmail.com|pass456|I77PEBZQNEBE67SU..."></textarea>
+    <div class="card-settings">
+      <label class="input-group" style="margin-top:8px">
+        <span class="input-label">Timeout (giây/job)</span>
+        <input type="number" id="ses-job-timeout" value="120" min="30" max="600" step="10" />
+      </label>
+    </div>
+    <div class="card-actions">
+      <button id="ses-btn-run" class="btn btn-primary">▶ Get Session</button>
+      <button id="ses-btn-stop-all" class="btn btn-danger">■ Stop All</button>
+      <button id="ses-btn-clear-input" class="btn btn-ghost">Clear input</button>
+      <span class="muted" id="ses-combo-count">0 combo</span>
+    </div>
+  </section>
+
+  <section class="card card-jobs">
+    <header class="card-head">
+      <h2>Jobs</h2>
+      <div style="display:flex; gap:8px; align-items:center">
+        <button id="ses-btn-clear-done" class="btn btn-ghost btn-small">Clear done</button>
+        <span class="muted" id="ses-job-summary">0 total</span>
+      </div>
+    </header>
+    <div id="ses-job-list" class="job-list">
+      <div class="empty">Paste combo + bấm Get Session.</div>
+    </div>
+  </section>
+
+  <section class="card card-log">
+    <header class="card-head">
+      <h2>Log</h2>
+      <span class="muted" id="ses-log-target">—</span>
+    </header>
+    <pre id="ses-log-pane" class="log-pane"></pre>
+  </section>
+
+  <section class="card card-error" style="grid-column: 1 / -1;">
+    <header class="card-head">
+      <h2>Error output</h2>
+      <button id="ses-btn-copy-error" class="btn btn-ghost btn-small">Copy all</button>
+    </header>
+    <pre id="ses-error-pane" class="output-pane">Chưa có lỗi.</pre>
+  </section>
+</main>
+
+<script src="/static/app.js"></script>
+<script src="/static/session.js"></script>
+</body>
+</html>
