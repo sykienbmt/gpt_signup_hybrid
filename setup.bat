@@ -1,39 +1,57 @@
 @echo off
 REM gpt_signup_hybrid — 1 lệnh setup + start web UI (Windows)
-REM Usage: double-click setup.bat hoặc chạy trong cmd/powershell
+REM Coi thư mục này là project root: .venv, runtime, .env đều nằm
+REM trong gpt_signup_hybrid/, không leak ra parent.
+REM
+REM Usage: double-click setup.bat hoặc chạy trong cmd/powershell.
 
 setlocal enabledelayedexpansion
-cd /d "%~dp0\.."
+cd /d "%~dp0"
+
+set "ROOT_DIR=%CD%"
+for %%i in ("%ROOT_DIR%\..") do set "PARENT_DIR=%%~fi"
 
 echo ═══════════════════════════════════════════════════════════
 echo   gpt_signup_hybrid — auto setup + start (Windows)
+echo   root:   %ROOT_DIR%
+echo   parent: %PARENT_DIR%
 echo ═══════════════════════════════════════════════════════════
 echo.
 
-REM 1. Python venv
+REM 1. Python venv trong chính package
 if not exist ".venv" (
-    echo [1/5] Creating .venv...
+    echo [1/6] Creating .venv...
     python -m venv .venv
 ) else (
-    echo [1/5] .venv exists √
+    echo [1/6] .venv exists √
 )
 
 REM 2. Install deps
-echo [2/5] Installing dependencies...
+echo [2/6] Installing dependencies...
 .venv\Scripts\pip install -q --upgrade pip 2>nul
 .venv\Scripts\pip install -q pydantic typer httpx "curl_cffi>=0.7" pyotp fastapi uvicorn camoufox playwright 2>nul
 
-REM 3. Playwright Firefox
-echo [3/5] Installing Playwright Firefox...
+REM 3. Inject .pth để Python import package được khi CWD = package
+echo [3/6] Registering parent dir in venv site-packages...
+for /f "delims=" %%i in ('.venv\Scripts\python -c "import site; print(site.getsitepackages()[0])" 2^>nul') do set "SITE_PKG=%%i"
+if defined SITE_PKG (
+    echo %PARENT_DIR%> "%SITE_PKG%\_gpt_signup_hybrid_root.pth"
+    echo   √ %SITE_PKG%\_gpt_signup_hybrid_root.pth
+) else (
+    echo   WARN: không xác định được site-packages, skip .pth injection.
+)
+
+REM 4. Playwright Firefox
+echo [4/6] Installing Playwright Firefox...
 .venv\Scripts\playwright install firefox 2>nul
 
-REM 4. Camoufox binary
-echo [4/5] Fetching Camoufox binary...
+REM 5. Camoufox binary
+echo [5/6] Fetching Camoufox binary...
 .venv\Scripts\python -m camoufox fetch 2>nul
 
-REM 5. .env
+REM 6. .env
 if not exist ".env" (
-    echo [5/5] Creating .env...
+    echo [6/6] Creating .env...
     (
         echo BROWSER_ENGINE=camoufox
         echo RUNTIME_DIR=runtime
@@ -42,25 +60,29 @@ if not exist ".env" (
         echo BROWSER_USE_PROFILE_TEMPLATE=true
         echo BROWSER_PROFILE_TEMPLATE_DIR=runtime/profiles/template
         echo BROWSER_CAMOUFOX_PROFILE_DIR=runtime/profiles/camoufox_template
+        echo HYBRID_MAX_CONCURRENT=2
+        echo HYBRID_OUTLOOK_PROXY=
+        echo HYBRID_JOB_TIMEOUT=240
     ) > .env
     echo   √ .env created
 ) else (
-    echo [5/5] .env exists √
+    echo [6/6] .env exists √
 )
 
-REM Create runtime dirs
+REM Tạo runtime dirs
 if not exist "runtime\profiles\template" mkdir "runtime\profiles\template"
 if not exist "runtime\profiles\camoufox_template" mkdir "runtime\profiles\camoufox_template"
 if not exist "runtime\sessions" mkdir "runtime\sessions"
 if not exist "runtime\outlook_state" mkdir "runtime\outlook_state"
 if not exist "runtime\outlook_pool" mkdir "runtime\outlook_pool"
+if not exist "runtime\har_hybrid" mkdir "runtime\har_hybrid"
 
 echo.
 echo ═══════════════════════════════════════════════════════════
 echo   √ Setup done. Starting web UI...
 echo   → http://127.0.0.1:8089/
 echo.
-echo   Paste combo Outlook vao textarea + bam Chay.
+echo   Paste combo vao textarea + bam Run.
 echo   Format: email^|password^|refresh_token^|client_id
 echo ═══════════════════════════════════════════════════════════
 echo.

@@ -11,7 +11,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from ..mail_providers import OutlookCombo, OutlookComboError
+from ..mail_providers import OutlookCombo, OutlookComboError, GmailAdvancedProvider, GmailAdvancedParseError
 from ..models import SignupRequest
 
 
@@ -20,6 +20,10 @@ from ..models import SignupRequest
 
 class MailModeParseError(Exception):
     """Parse line fail cho 1 mail mode."""
+
+
+class GmailAdvancedModeParseError(MailModeParseError):
+    """Parse line fail cho Gmail Advanced mode."""
 
 
 # ─── Data types ───────────────────────────────────────────────────────
@@ -146,12 +150,72 @@ WORKER_MODE = MailModeSpec(
 )
 
 
+# ─── Gmail Advanced mode ──────────────────────────────────────────────
+
+
+def _parse_gmail_advanced_line(line: str) -> ParsedLine:
+    """Parse line `email|api_url` hoặc chỉ `api_url` cho Gmail Advanced."""
+    try:
+        email, api_url = GmailAdvancedProvider.parse_line(line)
+    except GmailAdvancedParseError as exc:
+        raise MailModeParseError(str(exc)) from exc
+    # Nếu URL-only → email rỗng, dùng placeholder (sẽ resolve từ API pre_check)
+    display_email = email if email else f"(pending) {api_url[:50]}..."
+    return ParsedLine(email=display_email, raw=line)
+
+
+def _build_gmail_advanced_request(
+    parsed: ParsedLine,
+    *,
+    worker_config: dict[str, str] | None = None,
+    password: str | None = None,
+    headless: bool = True,
+    keep_browser_open: bool = False,
+    proxy: str | None = None,
+) -> SignupRequest:
+    raw = parsed.raw.strip()
+    # Detect format: URL-only hoặc email|url
+    if raw.startswith(("http://", "https://")):
+        api_url = raw
+        email = ""  # sẽ fill từ pre_check
+    else:
+        parts = raw.split("|", 1)
+        email = parts[0].strip()
+        api_url = parts[1].strip() if len(parts) == 2 else ""
+
+    # Nếu email rỗng → dùng placeholder, pre_check sẽ resolve
+    signup_email = email if email else "pending@gmail-advanced.local"
+    return SignupRequest(
+        email=signup_email,
+        mail_provider="gmail_advanced",
+        gmail_api_url=api_url,
+        otp_timeout_seconds=300.0,
+        otp_poll_interval_seconds=5.0,
+        headless=headless,
+        keep_browser_open=keep_browser_open,
+        password=password,
+        proxy=proxy,
+    )
+
+
+GMAIL_ADVANCED_MODE = MailModeSpec(
+    id="gmail_advanced",
+    label="Gmail Advanced (API)",
+    input_placeholder="https://checkotpgmail.live/otp/2605201652376818498?t=...\nbrandonspencer7424@gmail.com|https://checkotpgmail.live/otp/...",
+    input_help="Mỗi dòng: api_url hoặc email|api_url. Pre-check mail_status=live trước khi chạy.",
+    config_schema=[],
+    parse_line=_parse_gmail_advanced_line,
+    build_request=_build_gmail_advanced_request,
+)
+
+
 # ─── Registry ─────────────────────────────────────────────────────────
 
 
 _REGISTRY: dict[str, MailModeSpec] = {
     OUTLOOK_MODE.id: OUTLOOK_MODE,
     WORKER_MODE.id: WORKER_MODE,
+    GMAIL_ADVANCED_MODE.id: GMAIL_ADVANCED_MODE,
 }
 
 

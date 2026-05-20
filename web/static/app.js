@@ -90,6 +90,10 @@
       input_help: 'One iCloud email per line via Worker OTP.',
       input_placeholder: 'user@icloud.com',
     },
+    gmail_advanced: {
+      input_help: 'Mỗi dòng: api_url hoặc email|api_url. Pre-check mail_status=live.',
+      input_placeholder: 'https://checkotpgmail.live/otp/...\nbrandonspencer7424@gmail.com|https://checkotpgmail.live/otp/...',
+    },
   });
 
   function fmtDuration(secs) {

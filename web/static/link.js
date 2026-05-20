@@ -1,17 +1,34 @@
-/* gpt_signup_hybrid — Get Link tab logic */
+/* gpt_signup_hybrid — Get Link tab logic (3 modes: combo, session_json, access_token) */
 (() => {
   'use strict';
+
+  const MODE_CONFIG = {
+    combo: {
+      hint: 'One line per combo: email|password|2fa_secret',
+      placeholder: 'email@hotmail.com|password123|DNPARKKMM5EYOPDG...\nemail2@outlook.com|pass456|I77PEBZQNEBE67SU...',
+    },
+    session_json: {
+      hint: 'Paste one session JSON object (from /api/auth/session)',
+      placeholder: '{\n  "accessToken": "eyJhbGci...",\n  "user": { "email": "user@example.com", ... },\n  ...\n}',
+    },
+    access_token: {
+      hint: 'One raw accessToken (JWT) per line',
+      placeholder: 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ...\neyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ...',
+    },
+  };
 
   const state = {
     jobs: new Map(),
     order: [],
     activeJobId: null,
     maxConcurrent: 1,
+    mode: 'combo',
   };
 
   const $ = (id) => document.getElementById(id);
   const dom = {
     comboInput: $('link-combo-input'),
+    modeHint: $('link-mode-hint'),
     btnRun: $('link-btn-run'),
     btnStopAll: $('link-btn-stop-all'),
     btnClearInput: $('link-btn-clear-input'),
@@ -25,6 +42,20 @@
     logTarget: $('link-log-target'),
     errorPane: $('link-error-pane'),
   };
+
+  // ─── Mode switching ───
+  const modeBtns = document.querySelectorAll('.link-mode-btn');
+  modeBtns.forEach((btn) => {
+    btn.addEventListener('click', () => {
+      modeBtns.forEach((b) => b.classList.remove('active'));
+      btn.classList.add('active');
+      state.mode = btn.dataset.mode;
+      const cfg = MODE_CONFIG[state.mode];
+      dom.modeHint.textContent = cfg.hint;
+      dom.comboInput.placeholder = cfg.placeholder;
+      updateComboCount();
+    });
+  });
 
   function escHtml(s) {
     return String(s).replace(/[&<>"']/g, (c) => ({
@@ -49,11 +80,21 @@
   }
 
   function updateComboCount() {
-    const lines = dom.comboInput.value.split('\n').filter((line) => {
-      const trimmed = line.trim();
-      return trimmed && !trimmed.startsWith('#');
-    });
-    dom.comboCount.textContent = `${lines.length} combo${lines.length === 1 ? '' : 's'}`;
+    const text = dom.comboInput.value.trim();
+    let count = 0;
+
+    if (state.mode === 'combo' || state.mode === 'access_token') {
+      count = text.split('\n').filter((line) => {
+        const trimmed = line.trim();
+        return trimmed && !trimmed.startsWith('#');
+      }).length;
+    } else if (state.mode === 'session_json') {
+      // Single JSON only — valid or not
+      count = text.length > 0 ? 1 : 0;
+    }
+
+    const label = state.mode === 'session_json' ? 'session' : 'item';
+    dom.comboCount.textContent = `${count} ${label}${count === 1 ? '' : 's'}`;
   }
 
   function renderErrors() {
@@ -67,7 +108,7 @@
 
   function renderJobs() {
     if (state.order.length === 0) {
-      dom.jobList.innerHTML = '<div class="empty">Paste combos and click Get Link.</div>';
+      dom.jobList.innerHTML = '<div class="empty">Paste input and click Get Link.</div>';
       dom.jobSummary.textContent = '0 total';
       renderErrors();
       return;
@@ -104,11 +145,13 @@
         ? `<div class="job-meta" title="${escHtml(job.payment_link)}">${escHtml(job.payment_link)}</div>`
         : '';
 
+      const modeTag = job.mode && job.mode !== 'combo' ? `<span class="muted">[${escHtml(job.mode)}]</span> ` : '';
+
       return `
         <div class="${cls}" data-id="${escHtml(id)}">
           <div class="job-status status-${escHtml(job.status)}">${escHtml(job.status)}</div>
           <div class="job-main">
-            <div class="job-email" title="${escHtml(job.email)}">${escHtml(job.email)}</div>
+            <div class="job-email" title="${escHtml(job.email)}">${modeTag}${escHtml(job.email)}</div>
             ${meta}
           </div>
           <div class="job-duration">${escHtml(fmtDuration(job.duration))}</div>
@@ -238,7 +281,7 @@
   dom.btnRun.addEventListener('click', async () => {
     const combos = dom.comboInput.value.trim();
     if (!combos) {
-      alert('Paste combos first.');
+      alert('Paste input first.');
       return;
     }
 
@@ -246,7 +289,7 @@
     try {
       await api('/api/link/jobs', {
         method: 'POST',
-        body: JSON.stringify({ combos }),
+        body: JSON.stringify({ combos, mode: state.mode }),
       });
     } catch (err) {
       alert('Error: ' + err.message);
@@ -272,6 +315,7 @@
     window.GptUi.copyText(dom.errorPane.textContent);
   });
 
+  dom.comboInput.addEventListener('input', updateComboCount);
   updateComboCount();
   connectSSE();
 

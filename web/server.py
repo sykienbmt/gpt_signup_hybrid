@@ -27,7 +27,7 @@ def _asset_version() -> str:
     return str(latest_mtime or 1)
 
 
-app = FastAPI(title="gpt_signup_hybrid web UI", version="1.0.1")
+app = FastAPI(title="gpt_signup_hybrid web UI", version="1.0.2")
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -43,7 +43,7 @@ class AddJobsRequest(BaseModel):
     )
     mail_mode: str = Field(
         default="outlook",
-        description="Mail mode: 'outlook' hoặc 'worker'.",
+        description="Mail mode: 'outlook', 'worker', hoặc 'gmail_advanced'.",
     )
     email_logs_url: str | None = Field(
         default=None,
@@ -536,14 +536,18 @@ async def session_events(request: Request) -> StreamingResponse:
 
 
 class AddLinkJobsRequest(BaseModel):
-    combos: str = Field(..., description="email|password|secret per line")
+    combos: str = Field(..., description="Input text — format depends on mode")
+    mode: str = Field(default="combo", description="combo | session_json | access_token")
 
 
 @app.post("/api/link/jobs")
 async def add_link_jobs(payload: AddLinkJobsRequest) -> JSONResponse:
+    mode = payload.mode
+    if mode not in ("combo", "session_json", "access_token"):
+        raise HTTPException(400, f"invalid mode: {mode}")
     lines = payload.combos.splitlines()
     lm = get_link_manager()
-    jobs = lm.add_jobs(lines)
+    jobs = lm.add_jobs(lines, mode=mode)  # type: ignore[arg-type]
     return JSONResponse({"added": len(jobs), "jobs": [j.to_dict() for j in jobs]})
 
 

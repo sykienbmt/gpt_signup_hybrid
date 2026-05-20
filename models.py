@@ -29,13 +29,19 @@ class SignupRequest(BaseModel):
     off_font: bool = Field(default=False, description="Tắt camoufox font randomization.")
     profile_template: bool = Field(default=True, description="Clone profile template (cookies, addons).")
 
-    # Polling OTP — chọn 1 trong 2 provider:
+    # Polling OTP — chọn 1 trong 3 provider:
     #   - Worker logs API (icloud-cf-mail style) — default cho mail @icloud.com qua relay.
     #   - Outlook combo (Microsoft Graph) — cho mail @hotmail.com / @outlook.com.
+    #   - Gmail Advanced (checkotpgmail.live API) — cho mail @gmail.com mua qua dịch vụ.
     mail_provider: str = Field(
         default="worker",
-        description="Provider: 'worker' hoặc 'outlook'.",
-        pattern="^(worker|outlook)$",
+        description="Provider: 'worker', 'outlook', hoặc 'gmail_advanced'.",
+        pattern="^(worker|outlook|gmail_advanced)$",
+    )
+    # Gmail Advanced config
+    gmail_api_url: str | None = Field(
+        default=None,
+        description="API URL checkotpgmail.live (dùng khi mail_provider='gmail_advanced').",
     )
     # Worker config
     email_logs_url: str = Field(

@@ -164,7 +164,7 @@ def enable_2fa_cmd(
 @app.command("version", hidden=True)
 def _version_cmd() -> None:
     """Print package version (hidden helper)."""
-    typer.echo("gpt_signup_hybrid 1.0.1")
+    typer.echo("gpt_signup_hybrid 1.0.2")
 
 
 @app.command("web")

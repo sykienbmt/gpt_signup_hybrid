@@ -12,6 +12,7 @@ from .mail_providers import (
     MailProvider,
     OutlookComboError,
     OutlookProviderUnavailable,
+    build_provider_gmail_advanced,
     build_provider_outlook,
     build_provider_worker,
 )
@@ -28,6 +29,18 @@ def _build_mail_provider(request: SignupRequest, *, settings) -> MailProvider:
             combo=request.outlook_combo,
             state_dir=settings.runtime_dir / "outlook_state",
             proxy=request.proxy,
+        )
+    if request.mail_provider == "gmail_advanced":
+        if not request.gmail_api_url:
+            raise ValueError("mail_provider='gmail_advanced' yêu cầu gmail_api_url")
+        # URL-only mode dùng placeholder email trong SignupRequest (Pydantic validation),
+        # nhưng provider cần nhận "" để pre_check biết cần resolve từ API.
+        provider_email = request.email
+        if provider_email == "pending@gmail-advanced.local":
+            provider_email = ""
+        return build_provider_gmail_advanced(
+            email=provider_email,
+            api_url=request.gmail_api_url,
         )
     if request.mail_provider == "worker":
         return build_provider_worker(
@@ -62,6 +75,23 @@ async def run_signup(request: SignupRequest, *, log=print) -> SignupResult:
         log(f"[signup] phase 1: browser → email-verification → submit OTP → /about-you (email={request.email})")
         otp_started_at = datetime.now(timezone.utc).replace(microsecond=0)
         provider = _build_mail_provider(request, settings=settings)
+
+        # ── Pre-check cho Gmail Advanced: verify mail_status=live trước khi mở browser ──
+        if hasattr(provider, "pre_check"):
+            try:
+                await provider.pre_check(log=log)
+            finally:
+                # Luôn update email nếu provider đã resolve được (dù pre_check fail)
+                if provider.email and provider.email != request.email:
+                    request = request.model_copy(update={"email": provider.email})
+                    result.email = provider.email
+                    log(f"[signup] email updated from API: {request.email}")
+            # Guard: nếu sau pre_check vẫn không có email thật → fail
+            if not provider.email or provider.email == "pending@gmail-advanced.local":
+                raise ValueError(
+                    "Gmail Advanced: API không trả email, không thể tiếp tục signup"
+                )
+
         handoff, otp_seconds = await run_browser_phase(
             request=request,
             settings=settings,

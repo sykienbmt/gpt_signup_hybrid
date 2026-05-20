@@ -205,9 +205,14 @@
   <section class="card card-input">
     <header class="card-head">
       <h2>Input</h2>
-      <span class="muted card-head-note">One line per combo: email|password|2fa_secret</span>
+      <div class="link-mode-tabs">
+        <button class="link-mode-btn active" data-mode="combo">Combo</button>
+        <button class="link-mode-btn" data-mode="session_json">Session JSON</button>
+        <button class="link-mode-btn" data-mode="access_token">Access Token</button>
+      </div>
     </header>
-    <textarea class="combo-textarea" id="link-combo-input" placeholder="email@hotmail.com|password123|DNPARKKMM5EYOPDG...&#10;email2@outlook.com|pass456|I77PEBZQNEBE67SU..." maxlength="5000"></textarea>
+    <span class="muted card-head-note" id="link-mode-hint">One line per combo: email|password|2fa_secret</span>
+    <textarea class="combo-textarea" id="link-combo-input" placeholder="email@hotmail.com|password123|DNPARKKMM5EYOPDG...&#10;email2@outlook.com|pass456|I77PEBZQNEBE67SU..." maxlength="50000"></textarea>
     <div class="card-settings">
       <label class="input-group settings-field-compact">
         <span class="input-label">Timeout (s/job)</span>

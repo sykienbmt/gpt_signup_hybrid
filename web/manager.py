@@ -10,7 +10,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from ..config import load_settings, runtime_session_dir
 from ..mail_providers import OutlookCombo, OutlookComboError
@@ -572,7 +572,17 @@ class JobManager:
             )
             result: SignupResult = await run_signup(request, log=log)
 
+            # Update job email nếu đã resolve từ API (URL-only gmail_advanced)
+            if result.email and result.email != job.email:
+                job.email = result.email
+                self._broadcast_job(job)
+
             if not result.success:
+                job.status = "error"
+                job.error = result.error or "signup failed"
+                job.finished_at = time.time()
+                self._broadcast_job(job)
+                return
                 job.status = "error"
                 job.error = result.error or "signup failed"
                 job.finished_at = time.time()
@@ -1040,12 +1050,18 @@ def get_session_manager() -> SessionJobManager:
 from ..payment_link import get_checkout_url, PaymentLinkError  # noqa: E402
 
 
+LinkMode = Literal["combo", "session_json", "access_token"]
+
+
 @dataclass
 class LinkJob:
     id: str
     email: str
     password: str
     secret: str | None = None
+    mode: LinkMode = "combo"
+    # Pre-provided token (dùng cho mode session_json / access_token)
+    _access_token: str | None = field(default=None, repr=False)
     status: JobStatus = "queued"
     log_lines: list[str] = field(default_factory=list)
     error: str | None = None
@@ -1058,6 +1074,7 @@ class LinkJob:
         return {
             "id": self.id,
             "email": self.email,
+            "mode": self.mode,
             "status": self.status,
             "error": self.error,
             "payment_link": self.payment_link,
@@ -1182,11 +1199,30 @@ class LinkJobManager:
     def _broadcast_job(self, job: LinkJob) -> None:
         self._broadcast({"type": "job", "job": job.to_dict()})
 
-    def add_jobs(self, combos: list[str]) -> list[LinkJob]:
-        """Parse input lines: email|password|secret. Dedup theo email."""
+    def add_jobs(self, lines: list[str], *, mode: LinkMode = "combo") -> list[LinkJob]:
+        """Parse input based on mode. Dedup theo email."""
         existing_emails = {j.email.lower() for j in self.jobs.values() if j.status != "cancelled"}
         out: list[LinkJob] = []
-        for raw in combos:
+
+        if mode == "combo":
+            out = self._parse_combo(lines, existing_emails)
+        elif mode == "session_json":
+            out = self._parse_session_json(lines, existing_emails)
+        elif mode == "access_token":
+            out = self._parse_access_token(lines, existing_emails)
+        else:
+            return out
+
+        self._ensure_workers()
+        for j in out:
+            if j.status == "queued":
+                self._job_queue.put_nowait(j.id)
+        return out
+
+    def _parse_combo(self, lines: list[str], existing_emails: set[str]) -> list[LinkJob]:
+        """Mode combo: email|password|secret per line."""
+        out: list[LinkJob] = []
+        for raw in lines:
             line = raw.strip()
             if not line or line.startswith("#"):
                 continue
@@ -1195,6 +1231,7 @@ class LinkJobManager:
                 jid = uuid.uuid4().hex[:12]
                 job = LinkJob(
                     id=jid, email="<invalid>", password="",
+                    mode="combo",
                     status="error", error=f"format sai, cần email|password|secret: {line[:60]}",
                     finished_at=time.time(),
                 )
@@ -1213,17 +1250,127 @@ class LinkJobManager:
             existing_emails.add(email.lower())
 
             jid = uuid.uuid4().hex[:12]
-            job = LinkJob(id=jid, email=email, password=password, secret=secret)
+            job = LinkJob(id=jid, email=email, password=password, secret=secret, mode="combo")
             self.jobs[jid] = job
             self.order.append(jid)
             self._broadcast_job(job)
             out.append(job)
-
-        self._ensure_workers()
-        for j in out:
-            if j.status == "queued":
-                self._job_queue.put_nowait(j.id)
         return out
+
+    def _parse_session_json(self, lines: list[str], existing_emails: set[str]) -> list[LinkJob]:
+        """Mode session_json: toàn bộ input là 1 JSON object duy nhất chứa accessToken."""
+        out: list[LinkJob] = []
+        full_text = "\n".join(lines).strip()
+        if not full_text:
+            return out
+
+        try:
+            data = json.loads(full_text)
+        except (json.JSONDecodeError, ValueError) as exc:
+            jid = uuid.uuid4().hex[:12]
+            job = LinkJob(
+                id=jid, email="<invalid>", password="",
+                mode="session_json",
+                status="error", error=f"invalid JSON: {exc}",
+                finished_at=time.time(),
+            )
+            self.jobs[jid] = job
+            self.order.append(jid)
+            self._broadcast_job(job)
+            out.append(job)
+            return out
+
+        if not isinstance(data, dict):
+            jid = uuid.uuid4().hex[:12]
+            job = LinkJob(
+                id=jid, email="<invalid>", password="",
+                mode="session_json",
+                status="error", error="JSON phải là object, không phải array/primitive",
+                finished_at=time.time(),
+            )
+            self.jobs[jid] = job
+            self.order.append(jid)
+            self._broadcast_job(job)
+            out.append(job)
+            return out
+
+        token = data.get("accessToken") or ""
+        user = data.get("user") or {}
+        email = user.get("email") or f"token_{uuid.uuid4().hex[:6]}"
+
+        if not token:
+            jid = uuid.uuid4().hex[:12]
+            job = LinkJob(
+                id=jid, email=email, password="",
+                mode="session_json",
+                status="error", error="session JSON thiếu accessToken",
+                finished_at=time.time(),
+            )
+            self.jobs[jid] = job
+            self.order.append(jid)
+            self._broadcast_job(job)
+            out.append(job)
+            return out
+
+        if email.lower() in existing_emails:
+            return out
+        existing_emails.add(email.lower())
+
+        jid = uuid.uuid4().hex[:12]
+        job = LinkJob(
+            id=jid, email=email, password="", mode="session_json",
+            _access_token=token,
+        )
+        self.jobs[jid] = job
+        self.order.append(jid)
+        self._broadcast_job(job)
+        out.append(job)
+        return out
+
+    def _parse_access_token(self, lines: list[str], existing_emails: set[str]) -> list[LinkJob]:
+        """Mode access_token: mỗi line là 1 raw JWT."""
+        out: list[LinkJob] = []
+        for raw in lines:
+            token = raw.strip()
+            if not token or token.startswith("#"):
+                continue
+
+            # Tạo label từ token (email nếu decode được, hoặc token prefix)
+            email = self._extract_email_from_jwt(token) or f"token_...{token[-8:]}"
+
+            if email.lower() in existing_emails:
+                continue
+            existing_emails.add(email.lower())
+
+            jid = uuid.uuid4().hex[:12]
+            job = LinkJob(
+                id=jid, email=email, password="", mode="access_token",
+                _access_token=token,
+            )
+            self.jobs[jid] = job
+            self.order.append(jid)
+            self._broadcast_job(job)
+            out.append(job)
+        return out
+
+    @staticmethod
+    def _extract_email_from_jwt(token: str) -> str | None:
+        """Decode JWT payload (no verify) để lấy email."""
+        import base64
+        parts = token.split(".")
+        if len(parts) < 2:
+            return None
+        try:
+            payload_b64 = parts[1]
+            # Fix padding
+            padding = 4 - len(payload_b64) % 4
+            if padding != 4:
+                payload_b64 += "=" * padding
+            payload_bytes = base64.urlsafe_b64decode(payload_b64)
+            payload = json.loads(payload_bytes)
+            return payload.get("email") or payload.get("https://api.openai.com/auth", {}).get("email")
+        except Exception:
+            return None
 
     def stop_all(self) -> int:
         while not self._job_queue.empty():
@@ -1313,46 +1460,61 @@ class LinkJobManager:
             def log(msg: str) -> None:
                 self._job_log(job, msg)
 
-            # Step 1: Login via get_session to obtain access_token
-            log("[login] starting")
-            try:
-                session_data = await asyncio.wait_for(
-                    get_session(
-                        email=job.email,
-                        password=job.password,
-                        secret=job.secret,
-                        headless=self._headless,
-                        log=log,
-                    ),
-                    timeout=self._job_timeout,
-                )
-            except asyncio.TimeoutError:
-                job.status = "error"
-                job.error = f"timeout {self._job_timeout:.0f}s exceeded (login phase)"
-                job.finished_at = time.time()
-                self._job_log(job, f"[fatal] timeout {self._job_timeout:.0f}s")
-                self._broadcast_job(job)
-                return
-            except SessionError as exc:
-                job.status = "error"
-                job.error = f"login: {exc}"
-                job.finished_at = time.time()
-                self._job_log(job, f"[login] failed: {exc}")
-                self._broadcast_job(job)
-                return
+            # ── Resolve access_token theo mode ──
+            access_token: str | None = None
 
-            access_token = session_data.get("accessToken") if session_data else None
-            if not access_token:
-                job.status = "error"
-                job.error = "login: missing access_token in session"
-                job.finished_at = time.time()
-                self._job_log(job, "[login] failed: no access_token in response")
-                self._broadcast_job(job)
-                return
+            if job.mode == "combo":
+                # Login via browser → obtain token
+                log("[login] starting")
+                try:
+                    session_data = await asyncio.wait_for(
+                        get_session(
+                            email=job.email,
+                            password=job.password,
+                            secret=job.secret,
+                            headless=self._headless,
+                            log=log,
+                        ),
+                        timeout=self._job_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    job.status = "error"
+                    job.error = f"timeout {self._job_timeout:.0f}s exceeded (login phase)"
+                    job.finished_at = time.time()
+                    self._job_log(job, f"[fatal] timeout {self._job_timeout:.0f}s")
+                    self._broadcast_job(job)
+                    return
+                except SessionError as exc:
+                    job.status = "error"
+                    job.error = f"login: {exc}"
+                    job.finished_at = time.time()
+                    self._job_log(job, f"[login] failed: {exc}")
+                    self._broadcast_job(job)
+                    return
 
-            log("[login] success")
+                access_token = session_data.get("accessToken") if session_data else None
+                if not access_token:
+                    job.status = "error"
+                    job.error = "login: missing accessToken in session"
+                    job.finished_at = time.time()
+                    self._job_log(job, "[login] failed: no accessToken in response")
+                    self._broadcast_job(job)
+                    return
+                log("[login] success")
 
-            # Step 2: Get payment link
+            elif job.mode in ("session_json", "access_token"):
+                # Token đã được parse sẵn
+                access_token = job._access_token
+                if not access_token:
+                    job.status = "error"
+                    job.error = "no access_token provided"
+                    job.finished_at = time.time()
+                    self._job_log(job, "[token] missing — nothing to do")
+                    self._broadcast_job(job)
+                    return
+                log(f"[token] using pre-provided token (mode={job.mode})")
+
+            # ── Get payment link ──
             log("[link] fetching payment URL")
             try:
                 url = await asyncio.wait_for(
