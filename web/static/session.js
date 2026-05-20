@@ -227,12 +227,16 @@
     if (!combos) { alert('Paste combo trước.'); return; }
     dom.btnRun.disabled = true;
     try {
-      // Sync config
-      const target = document.getElementById('mode').value === 'single' ? 1 : 3;
+      // Luôn sync config lên server trước khi chạy — đảm bảo session manager
+      // có đúng max_concurrent dù user không chủ động chuyển mode
+      const modeEl = document.getElementById('mode');
+      const target = modeEl && modeEl.value === 'single' ? 1 : 2;
+      const timeout = parseInt(dom.jobTimeout.value, 10) || 120;
       await api('/api/session/config', {
         method: 'POST',
-        body: JSON.stringify({ max_concurrent: target }),
+        body: JSON.stringify({ max_concurrent: target, job_timeout: timeout }),
       });
+      state.maxConcurrent = target;
       await api('/api/session/jobs', {
         method: 'POST',
         body: JSON.stringify({ combos }),
@@ -350,6 +354,16 @@
   // ── Init ──────────────────────────────────────────────────────────
   updateComboCount();
   connectSSE();
+
+  // Sync maxConcurrent khi topbar mode thay đổi (shared selector)
+  const _modeSelect = document.getElementById('mode');
+  if (_modeSelect) {
+    _modeSelect.addEventListener('change', () => {
+      state.maxConcurrent = _modeSelect.value === 'single' ? 1 : 2;
+    });
+    // Init từ giá trị hiện tại
+    state.maxConcurrent = _modeSelect.value === 'single' ? 1 : 2;
+  }
 
   // Duration timer
   setInterval(() => {

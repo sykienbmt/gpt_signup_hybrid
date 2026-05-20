@@ -444,9 +444,15 @@ async def get_session_config() -> JSONResponse:
 async def set_session_config(payload: SetSessionConfigRequest) -> JSONResponse:
     sm = get_session_manager()
     if payload.max_concurrent is not None:
-        sm.set_max_concurrent(payload.max_concurrent)
+        try:
+            sm.set_max_concurrent(payload.max_concurrent)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
     if payload.job_timeout is not None:
-        sm.set_job_timeout(payload.job_timeout)
+        try:
+            sm.set_job_timeout(payload.job_timeout)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
     return JSONResponse({
         "max_concurrent": sm.max_concurrent,
         "job_timeout": sm.job_timeout,
