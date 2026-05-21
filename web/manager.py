@@ -90,6 +90,8 @@ class Job:
             "user_id": self.user_id,
             "session_path": self.session_path,
             "has_session": self.session_data is not None,
+            "session_data": self.session_data,
+            "session_access_token": (self.session_data or {}).get("accessToken") if self.session_data else None,
             "payment_link": self.payment_link,
             "created_at": self.created_at,
             "started_at": self.started_at,
@@ -105,6 +107,68 @@ class Job:
         d["log_lines"] = list(self.log_lines)
         d["session_data"] = self.session_data
         return d
+
+
+_PLUS_TAGS = [
+    "mail", "inbox", "acc", "dev", "web", "hub", "box", "app",
+    "gpt", "ai", "bot", "user", "me", "hi", "ok", "go", "id",
+    "x1", "x2", "x3", "a1", "a2", "b1", "c1", "info", "reg",
+]
+
+
+def _generate_gmail_aliases(local: str, domain: str, count: int) -> list[str]:
+    """Tạo list alias Gmail random mix giữa +tag và dot trick."""
+    results: list[str] = []
+    used: set[str] = set()
+
+    def _dot_variants(name: str) -> list[str]:
+        if len(name) <= 2:
+            return []
+        variants = []
+        for i in range(1, len(name)):
+            v = name[:i] + "." + name[i:]
+            if ".." not in v:
+                variants.append(v)
+        for i in range(1, len(name)):
+            for j in range(i + 2, len(name)):
+                v = name[:i] + "." + name[i:j] + "." + name[j:]
+                if ".." not in v:
+                    variants.append(v)
+        return variants
+
+    dot_pool = _dot_variants(local)
+    random.shuffle(dot_pool)
+    tag_pool = _PLUS_TAGS[:]
+    random.shuffle(tag_pool)
+
+    dot_iter = iter(dot_pool)
+    tag_iter = iter(tag_pool)
+
+    attempts = 0
+    while len(results) < count and attempts < count * 6:
+        attempts += 1
+        strategy = random.choice(["plus", "dot", "plus_dot"])
+        email = None
+
+        if strategy == "plus":
+            tag = next(tag_iter, None)
+            if tag is None:
+                tag = f"r{random.randint(10, 99)}"
+            email = f"{local}+{tag}@{domain}"
+        elif strategy == "dot":
+            dv = next(dot_iter, None)
+            if dv:
+                email = f"{dv}@{domain}"
+        else:
+            dv = next(dot_iter, None) or local
+            tag = next(tag_iter, None) or f"r{random.randint(10, 99)}"
+            email = f"{dv}+{tag}@{domain}"
+
+        if email and email not in used:
+            used.add(email)
+            results.append(email)
+
+    return results
 
 
 class JobManager:
@@ -142,28 +206,22 @@ class JobManager:
         """Đảm bảo đủ worker theo max_concurrent. Gọi mỗi khi thêm job hoặc đổi config."""
         if not self._worker_started:
             self._worker_started = True
-        # Scale lên nếu cần thêm worker
+        self._workers = [w for w in self._workers if not w.done()]
         while len(self._workers) < self._max:
             w = asyncio.create_task(self._worker_loop())
             self._workers.append(w)
-        # Scale xuống: cancel worker thừa (chúng sẽ tự exit khi bị cancel ở chỗ queue.get)
         while len(self._workers) > self._max:
             w = self._workers.pop()
             w.cancel()
 
     async def _worker_loop(self) -> None:
-        """Worker lấy job từ queue, chạy tuần tự từng cái một.
-
-        Stagger: trước mỗi start, đợi tới ít nhất `_stagger_min_seconds` sau lần
-        start gần nhất + random jitter — tránh spawn nhiều browser cùng tick.
-        """
+        """Worker lấy job từ queue, chạy tuần tự từng cái một."""
         try:
             while True:
                 job_id = await self._job_queue.get()
                 job = self.jobs.get(job_id)
                 if job is None or job.status != "queued":
-                    continue  # job đã bị remove/cancel trước khi tới lượt
-                # Stagger start nếu max_concurrent > 1 (single mode không cần)
+                    continue
                 if self._max > 1:
                     async with self._stagger_lock:
                         now = time.monotonic()
@@ -176,7 +234,14 @@ class JobManager:
                             self._job_log(job, f"[stagger] đợi {wait:.1f}s trước khi start")
                             await asyncio.sleep(wait)
                         self._last_start_ts = time.monotonic()
-                await self._run_job_with_timeout(job)
+                subtask = asyncio.create_task(self._run_job_with_timeout(job))
+                self._tasks[job.id] = subtask
+                try:
+                    await subtask
+                except asyncio.CancelledError:
+                    if not subtask.cancelled():
+                        raise  # Worker bị cancel (shutdown)
+                    # Job bị cancel bên ngoài — worker tiếp tục
         except asyncio.CancelledError:
             pass
 
@@ -279,9 +344,32 @@ class JobManager:
                 return f"{scheme}://***@{host}"
         return p
 
-    def add_jobs(self, combos: list[str], *, default_password: str | None = None, mail_mode: str = "outlook", worker_config: dict[str, str] | None = None) -> list[Job]:
+    def add_jobs(self, combos: list[str], *, default_password: str | None = None, mail_mode: str = "outlook", worker_config: dict[str, str] | None = None, gmail_alias_expand: bool = False, gmail_alias_count: int = 1) -> list[Job]:
         """Thêm jobs từ list combo/email strings. Skip đã có trong list (dedup theo email)."""
         spec = get_spec(mail_mode)  # KeyError nếu mode lạ — server chặn trước
+
+        # Expand Gmail aliases với round-robin interleaving để tránh 2 alias cùng mail chạy song song
+        if gmail_alias_expand and mail_mode == "gmail_advanced":
+            alias_count = max(1, min(int(gmail_alias_count), 10))
+            groups: list[list[str]] = []
+            for raw in combos:
+                group = [raw]
+                line = raw.strip()
+                if not (not line or line.startswith("#") or line.startswith(("http://", "https://"))):
+                    parts = line.split("|", 1)
+                    if len(parts) == 2:
+                        base_email = parts[0].strip()
+                        api_url = parts[1].strip()
+                        if "@" in base_email:
+                            local_part = base_email.split("+")[0].split("@")[0]
+                            domain = base_email.split("@", 1)[1]
+                            aliases = _generate_gmail_aliases(local_part, domain, alias_count)
+                            group.extend(f"{a}|{api_url}" for a in aliases)
+                groups.append(group)
+            # Round-robin: [orig1,orig2,...] → [alias1_1,alias2_1,...] → [alias1_2,alias2_2,...]
+            max_len = max((len(g) for g in groups), default=0)
+            combos = [g[i] for i in range(max_len) for g in groups if i < len(g)]
+
         existing_emails = {j.email.lower() for j in self.jobs.values() if j.status != "cancelled"}
         out: list[Job] = []
         for raw in combos:
@@ -412,6 +500,37 @@ class JobManager:
         self._job_queue.put_nowait(job_id)
         return True
 
+    async def fetch_session_for_job(self, job_id: str) -> bool:
+        """Fetch /api/auth/session cho 1 job dùng cookies đã lưu ở session_path."""
+        job = self.jobs.get(job_id)
+        if not job or job.status != "success" or not job.session_path:
+            return False
+        # Đã có rồi → skip
+        if job.session_data and job.session_data.get("accessToken"):
+            return True
+        try:
+            sdata = json.loads(Path(job.session_path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        cookies = sdata.get("cookies", [])
+        if not cookies:
+            return False
+        from ..session_phase import SessionError, fetch_session_via_http
+        try:
+            self._job_log(job, "[fetch-session] calling /api/auth/session...")
+            session_data = await fetch_session_via_http(
+                cookies=cookies,
+                proxy=self._proxy,
+                timeout=30.0,
+            )
+            job.session_data = session_data
+            self._job_log(job, "[fetch-session] OK")
+            self._broadcast_job(job)
+            return True
+        except Exception as exc:
+            self._job_log(job, f"[fetch-session] failed: {exc}")
+            return False
+
     def list_jobs(self) -> list[dict[str, Any]]:
         return [self.jobs[jid].to_dict() for jid in self.order if jid in self.jobs]
 
@@ -430,8 +549,6 @@ class JobManager:
 
     async def _run_job_with_timeout(self, job: Job) -> None:
         """Wrap _run_job với timeout. Kill nếu vượt job_timeout."""
-        # Track task để có thể cancel từ bên ngoài
-        self._tasks[job.id] = asyncio.current_task()  # type: ignore[arg-type]
         try:
             # Kiểm tra nếu là retry-2fa-only
             retry_2fa_only = getattr(job, '_retry_2fa_only', False)
@@ -577,12 +694,16 @@ class JobManager:
                 job.email = result.email
                 self._broadcast_job(job)
 
+            # Auto-retry 1 lần nếu browser crash
+            if not result.success and result.error and result.error.startswith("browser_crash:"):
+                log(f"[retry] browser crashed, retrying once...")
+                await asyncio.sleep(3.0)
+                result = await run_signup(request, log=log)
+                if result.email and result.email != job.email:
+                    job.email = result.email
+                    self._broadcast_job(job)
+
             if not result.success:
-                job.status = "error"
-                job.error = result.error or "signup failed"
-                job.finished_at = time.time()
-                self._broadcast_job(job)
-                return
                 job.status = "error"
                 job.error = result.error or "signup failed"
                 job.finished_at = time.time()
@@ -783,6 +904,7 @@ class SessionJobManager:
     def _ensure_workers(self) -> None:
         if not self._worker_started:
             self._worker_started = True
+        self._workers = [w for w in self._workers if not w.done()]
         while len(self._workers) < self._max:
             w = asyncio.create_task(self._worker_loop())
             self._workers.append(w)
@@ -797,7 +919,6 @@ class SessionJobManager:
                 job = self.jobs.get(job_id)
                 if job is None or job.status != "queued":
                     continue
-                # Stagger start nếu max_concurrent > 1
                 if self._max > 1:
                     async with self._stagger_lock:
                         now = time.monotonic()
@@ -810,7 +931,13 @@ class SessionJobManager:
                             self._job_log(job, f"[stagger] đợi {wait:.1f}s trước khi start")
                             await asyncio.sleep(wait)
                         self._last_start_ts = time.monotonic()
-                await self._run_job(job)
+                subtask = asyncio.create_task(self._run_job(job))
+                self._tasks[job.id] = subtask
+                try:
+                    await subtask
+                except asyncio.CancelledError:
+                    if not subtask.cancelled():
+                        raise
         except asyncio.CancelledError:
             pass
 
@@ -979,7 +1106,6 @@ class SessionJobManager:
         return list(job.log_lines) if job else []
 
     async def _run_job(self, job: SessionJob) -> None:
-        self._tasks[job.id] = asyncio.current_task()  # type: ignore[arg-type]
         try:
             if job.id not in self.jobs:
                 return
@@ -1123,6 +1249,7 @@ class LinkJobManager:
     def _ensure_workers(self) -> None:
         if not self._worker_started:
             self._worker_started = True
+        self._workers = [w for w in self._workers if not w.done()]
         while len(self._workers) < self._max:
             w = asyncio.create_task(self._worker_loop())
             self._workers.append(w)
@@ -1137,7 +1264,6 @@ class LinkJobManager:
                 job = self.jobs.get(job_id)
                 if job is None or job.status != "queued":
                     continue
-                # Stagger start nếu max_concurrent > 1
                 if self._max > 1:
                     async with self._stagger_lock:
                         now = time.monotonic()
@@ -1150,7 +1276,13 @@ class LinkJobManager:
                             self._job_log(job, f"[stagger] đợi {wait:.1f}s trước khi start")
                             await asyncio.sleep(wait)
                         self._last_start_ts = time.monotonic()
-                await self._run_job(job)
+                subtask = asyncio.create_task(self._run_job(job))
+                self._tasks[job.id] = subtask
+                try:
+                    await subtask
+                except asyncio.CancelledError:
+                    if not subtask.cancelled():
+                        raise
         except asyncio.CancelledError:
             pass
 
@@ -1449,7 +1581,6 @@ class LinkJobManager:
         return list(job.log_lines) if job else []
 
     async def _run_job(self, job: LinkJob) -> None:
-        self._tasks[job.id] = asyncio.current_task()  # type: ignore[arg-type]
         try:
             if job.id not in self.jobs:
                 return

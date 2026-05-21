@@ -131,10 +131,22 @@ async def run_signup(request: SignupRequest, *, log=print) -> SignupResult:
     except (BrowserPhaseError, HttpPhaseError, TimeoutError, ValueError, OutlookComboError, OutlookProviderUnavailable) as exc:
         result.error = f"{type(exc).__name__}: {exc}"
         log(f"[signup] FAILED: {result.error}")
-    except Exception as exc:  # pragma: no cover — unexpected
-        result.error = f"unexpected {type(exc).__name__}: {exc}"
-        log(f"[signup] UNEXPECTED FAILURE: {result.error}")
-        raise
+    except Exception as exc:
+        msg = str(exc)
+        _BROWSER_CRASH_PATTERNS = (
+            "Connection closed while reading from the driver",
+            "Target closed",
+            "Browser closed",
+            "Page closed",
+            "Connection refused",
+        )
+        if any(p in msg for p in _BROWSER_CRASH_PATTERNS):
+            result.error = f"browser_crash: {msg}"
+            log(f"[signup] browser crash (retryable): {msg}")
+        else:
+            result.error = f"unexpected {type(exc).__name__}: {msg}"
+            log(f"[signup] UNEXPECTED FAILURE: {result.error}")
+            raise
     finally:
         log(f"[signup] total {time.monotonic() - t_total_start:.2f}s")
 

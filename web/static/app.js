@@ -32,6 +32,7 @@
     currentMailMode: 'outlook',
     proxy: null,              // proxy URL hiện active (từ server)
     proxyEditing: false,      // user đang gõ vào input → đừng overwrite từ SSE
+    successTab: 'basic',      // 'basic' | 'with-session'
   };
 
   // ── DOM refs ──────────────────────────────────────────────────────
@@ -52,6 +53,8 @@
     errorPane:   $('error-pane'),
     btnCopySuccess: $('btn-copy-success'),
     btnCopyError:   $('btn-copy-error'),
+    btnFetchSessions:    $('btn-fetch-sessions'),
+    fetchSessionsStatus: $('fetch-sessions-status'),
     statusPill:  $('status-pill'),
     modeSelect:  $('mode'),
     headlessToggle: $('headless-toggle'),
@@ -62,6 +65,11 @@
     // Post-reg toggles
     postRegSessionToggle: $('post-reg-session-toggle'),
     postRegLinkToggle:    $('post-reg-link-toggle'),
+    // Gmail alias toggle
+    gmailAliasToggle:     $('gmail-alias-toggle'),
+    gmailAliasWrap:       $('gmail-alias-toggle-wrap'),
+    gmailAliasCount:      $('gmail-alias-count'),
+    gmailAliasCountWrap:  $('gmail-alias-count-wrap'),
     // Proxy strip
     proxyInput:        $('proxy-input'),
     btnProxyTest:      $('btn-proxy-test'),
@@ -239,30 +247,85 @@
     }
   }
 
+  // ── Success tabs ─────────────────────────────────────────────────
+  document.querySelectorAll('.success-tab-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.success-tab-btn').forEach((b) => b.classList.remove('active'));
+      btn.classList.add('active');
+      state.successTab = btn.dataset.stab;
+      dom.btnFetchSessions.classList.toggle('hidden', state.successTab !== 'with-session');
+      renderOutputs();
+    });
+  });
+
   // ── Render success/error output ──────────────────────────────────
   function renderOutputs() {
     const successLines = [];
     const errorLines = [];
+
     for (const id of state.order) {
       const j = state.jobs.get(id);
       if (!j) continue;
-      if (j.status === 'success' && j.secret) {
-        successLines.push(`${j.email}|${j.password || ''}|${j.secret}`);
+
+      if (j.status === 'success') {
+        const base = `${j.email}|${j.password || ''}|${j.secret || ''}`;
+        if (state.successTab === 'with-session') {
+          if (j.session_data) {
+            successLines.push(`${base}|${JSON.stringify(j.session_data)}`);
+          }
+          // jobs without session_data are omitted until fetched
+        } else {
+          if (j.secret) successLines.push(base);
+        }
       } else if (j.status === 'error') {
-        // Nếu đã có password (signup OK, 2FA fail) → vẫn xuất session output
         if (j.password) {
-          successLines.push(`${j.email}|${j.password}|no_2fa`);
+          const base = `${j.email}|${j.password}|no_2fa`;
+          if (state.successTab !== 'with-session') successLines.push(base);
         }
         errorLines.push(`${j.email}  →  ${j.error || 'unknown'}`);
       }
     }
+
+    const successCount = state.order.filter((id) => {
+      const j = state.jobs.get(id);
+      return j && j.status === 'success' && j.secret;
+    }).length;
+    const withSessionCount = state.order.filter((id) => {
+      const j = state.jobs.get(id);
+      return j && j.status === 'success' && j.session_data;
+    }).length;
+
+    if (state.successTab === 'with-session') {
+      dom.fetchSessionsStatus.textContent = successCount > 0
+        ? `${withSessionCount}/${successCount} fetched`
+        : '';
+    } else {
+      dom.fetchSessionsStatus.textContent = '';
+    }
+
     dom.successPane.textContent = successLines.length
       ? successLines.join('\n')
-      : 'Format: email|password|secret_2fa';
+      : (state.successTab === 'with-session'
+          ? 'Click "Fetch Sessions" to load session tokens.'
+          : 'Format: email|password|secret_2fa');
     dom.errorPane.textContent = errorLines.length
       ? errorLines.join('\n')
       : 'No errors yet.';
   }
+
+  // ── Fetch Sessions button ─────────────────────────────────────────
+  dom.btnFetchSessions.addEventListener('click', async () => {
+    dom.btnFetchSessions.disabled = true;
+    dom.fetchSessionsStatus.textContent = 'fetching...';
+    try {
+      const res = await api('/api/jobs/fetch-all-sessions', { method: 'POST' });
+      dom.fetchSessionsStatus.textContent = `${res.fetched}/${res.total} fetched`;
+    } catch (err) {
+      dom.fetchSessionsStatus.textContent = 'error: ' + err.message;
+    } finally {
+      dom.btnFetchSessions.disabled = false;
+    }
+  });
 
   // ── Render log của 1 job ─────────────────────────────────────────
   function renderLog(jobId) {
@@ -372,6 +435,8 @@
         combos,
         default_password: dom.defaultPassword.value.trim() || null,
         mail_mode: state.currentMailMode,
+        gmail_alias_expand: state.currentMailMode === 'gmail_advanced' && dom.gmailAliasToggle.checked,
+        gmail_alias_count: parseInt(dom.gmailAliasCount.value, 10) || 1,
       };
       if (state.currentMailMode === 'worker') {
         // Đọc trực tiếp từ DOM input (không chỉ localStorage — user có thể chưa trigger persist)
@@ -721,6 +786,10 @@
       dom.comboInput.placeholder = uiCopy.input_placeholder || spec.input_placeholder;
       dom.inputHint.textContent = uiCopy.input_help || spec.input_help;
     }
+    // Show Gmail alias toggle + count only for gmail_advanced mode
+    const isGmail = modeId === 'gmail_advanced';
+    dom.gmailAliasWrap.classList.toggle('hidden', !isGmail);
+    dom.gmailAliasCountWrap.classList.toggle('hidden', !isGmail);
     renderMailModeConfig(state.mailModes, modeId);
   }
 

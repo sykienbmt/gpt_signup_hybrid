@@ -53,6 +53,14 @@ class AddJobsRequest(BaseModel):
         default=None,
         description="[worker] Bearer token (VIEW_TOKEN).",
     )
+    gmail_alias_expand: bool = Field(
+        default=False,
+        description="[gmail_advanced] Tạo alias +gshN cho mỗi email|api_url.",
+    )
+    gmail_alias_count: int = Field(
+        default=1, ge=1, le=10,
+        description="[gmail_advanced] Số alias cần tạo (1-10).",
+    )
 
 
 class SetConfigRequest(BaseModel):
@@ -119,6 +127,8 @@ async def add_jobs(payload: AddJobsRequest) -> JSONResponse:
         default_password=payload.default_password,
         mail_mode=payload.mail_mode,
         worker_config=worker_config,
+        gmail_alias_expand=payload.gmail_alias_expand,
+        gmail_alias_count=payload.gmail_alias_count,
     )
     return JSONResponse({"added": len(jobs), "jobs": [j.to_dict() for j in jobs]})
 
@@ -147,6 +157,17 @@ async def stop_all_jobs() -> JSONResponse:
     manager = get_manager()
     stopped = manager.stop_all()
     return JSONResponse({"stopped": stopped})
+
+
+@app.post("/api/jobs/fetch-all-sessions")
+async def fetch_all_sessions() -> JSONResponse:
+    """Fetch /api/auth/session cho tất cả jobs success dùng cookies đã có."""
+    manager = get_manager()
+    job_ids = [jid for jid in list(manager.order)
+               if manager.jobs.get(jid) and manager.jobs[jid].status == "success"]
+    results = await asyncio.gather(*[manager.fetch_session_for_job(jid) for jid in job_ids])
+    fetched = sum(1 for r in results if r)
+    return JSONResponse({"fetched": fetched, "total": len(job_ids)})
 
 
 @app.post("/api/jobs/clear-finished")

@@ -126,6 +126,7 @@
       if (job.payment_link) {
         actions.push(
           `<button class="icon-btn" data-action="copy-link" data-id="${escHtml(id)}" title="Copy payment link">${window.GptUi.icon('link')}</button>`,
+          `<button class="icon-btn" data-action="show-qr" data-id="${escHtml(id)}" title="Show QR code">▣</button>`,
         );
       }
       if (job.status === 'running') {
@@ -263,6 +264,9 @@
         if (job && job.payment_link) {
           window.GptUi.copyText(job.payment_link);
         }
+      } else if (action === 'show-qr') {
+        const job = state.jobs.get(id);
+        if (job && job.payment_link) showQrModal(job.payment_link);
       } else if (action === 'retry') {
         api(`/api/link/jobs/${id}/retry`, { method: 'POST' }).catch((err) => alert(err.message));
       } else if (action === 'stop' || action === 'remove') {
@@ -313,6 +317,40 @@
 
   dom.btnCopyError.addEventListener('click', () => {
     window.GptUi.copyText(dom.errorPane.textContent);
+  });
+
+  // ─── QR Modal ───
+  const qrModal = document.getElementById('qr-modal');
+  const qrCanvasWrap = document.getElementById('qr-canvas-wrap');
+  const qrModalUrl = document.getElementById('qr-modal-url');
+  const qrModalClose = document.getElementById('qr-modal-close');
+  const qrModalBackdrop = qrModal.querySelector('.qr-modal-backdrop');
+  let _qrInstance = null;
+
+  function showQrModal(url) {
+    qrCanvasWrap.innerHTML = '';
+    _qrInstance = new QRCode(qrCanvasWrap, {
+      text: url,
+      width: 440,
+      height: 440,
+      colorDark: '#000000',
+      colorLight: '#ffffff',
+      correctLevel: QRCode.CorrectLevel.M,
+    });
+    qrModalUrl.textContent = url;
+    qrModal.classList.remove('hidden');
+  }
+
+  function closeQrModal() {
+    qrModal.classList.add('hidden');
+    qrCanvasWrap.innerHTML = '';
+    _qrInstance = null;
+  }
+
+  qrModalClose.addEventListener('click', closeQrModal);
+  qrModalBackdrop.addEventListener('click', closeQrModal);
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !qrModal.classList.contains('hidden')) closeQrModal();
   });
 
   dom.comboInput.addEventListener('input', updateComboCount);

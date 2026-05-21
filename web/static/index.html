@@ -100,6 +100,15 @@
           <span class="toggle-track"><span class="toggle-thumb"></span></span>
           <span class="toggle-label">Fetch Link</span>
         </label>
+        <label class="toggle-wrap hidden" id="gmail-alias-toggle-wrap" title="Tạo alias +gshN cho mỗi Gmail thuê để tối ưu số account">
+          <input type="checkbox" id="gmail-alias-toggle" />
+          <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          <span class="toggle-label">Gmail Alias</span>
+        </label>
+        <label class="input-group hidden" id="gmail-alias-count-wrap" style="flex-direction:row;align-items:center;gap:4px;">
+          <span class="input-label" style="white-space:nowrap;">×</span>
+          <input type="number" id="gmail-alias-count" value="1" min="1" max="10" step="1" style="width:52px;" title="Số alias cần tạo (1-10)" />
+        </label>
       </div>
     </div>
     <div class="card-actions">
@@ -134,7 +143,15 @@
   <section class="card card-success">
     <header class="card-head">
       <h2>Success output</h2>
-      <button id="btn-copy-success" class="btn btn-ghost btn-small">Copy All</button>
+      <div class="success-tab-row">
+        <button class="success-tab-btn active" data-stab="basic">Basic</button>
+        <button class="success-tab-btn" data-stab="with-session">With Session</button>
+      </div>
+      <div class="card-head-actions">
+        <button id="btn-fetch-sessions" class="btn btn-ghost btn-small hidden" title="Fetch /api/auth/session cho tất cả jobs success">Fetch Sessions</button>
+        <span id="fetch-sessions-status" class="muted"></span>
+        <button id="btn-copy-success" class="btn btn-ghost btn-small">Copy All</button>
+      </div>
     </header>
     <pre id="success-pane" class="output-pane">Format: email|password|secret_2fa</pre>
   </section>
@@ -257,6 +274,20 @@
   </section>
 </main>
 
+<!-- QR modal -->
+<div id="qr-modal" class="qr-modal hidden" role="dialog" aria-modal="true">
+  <div class="qr-modal-backdrop"></div>
+  <div class="qr-modal-box">
+    <div class="qr-modal-header">
+      <span class="qr-modal-title">Payment QR</span>
+      <button id="qr-modal-close" class="icon-btn" title="Close">✕</button>
+    </div>
+    <div id="qr-canvas-wrap"></div>
+    <div id="qr-modal-url" class="qr-modal-url muted"></div>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 <script src="/static/app.js?v=__ASSET_VERSION__"></script>
 <script src="/static/session.js?v=__ASSET_VERSION__"></script>
 <script src="/static/link.js?v=__ASSET_VERSION__"></script>

@@ -1,5 +1,7 @@
 /* gpt_signup_hybrid web UI — dark mode minimal 2026 */
 
+.hidden { display: none !important; }
+
 :root {
   --bg:        #0b0d10;
   --bg-elev:   #14171c;
@@ -224,7 +226,7 @@ body {
 }
 
 .card-input    { grid-area: input; }
-.card-jobs     { grid-area: jobs; }
+.card-jobs     { grid-area: jobs; max-height: calc(100vh - 240px); }
 .card-log      { grid-area: log; }
 .card-success  { grid-area: success; }
 .card-error    { grid-area: error; }
@@ -239,8 +241,7 @@ body {
       "log"
       "success"
       "error";
-    overflow-y: auto;
-    overflow-x: hidden;
+    overflow: visible;
     padding: 12px;
     gap: 12px;
     height: auto;
@@ -1040,4 +1041,79 @@ body {
   color: var(--accent);
   background: var(--bg-elev-2);
   border-color: rgba(122, 140, 255, 0.12);
+}
+
+/* Success output tabs */
+.success-tab-row {
+  display: flex;
+  gap: 4px;
+}
+.success-tab-btn {
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--fg-mute);
+  padding: 3px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+  letter-spacing: 0.3px;
+}
+.success-tab-btn:hover { color: var(--fg); background: var(--bg-elev-2); }
+.success-tab-btn.active {
+  color: var(--accent);
+  background: var(--bg-elev-2);
+  border-color: rgba(122, 140, 255, 0.12);
+}
+
+/* ── QR Modal ─────────────────────────────────────────────── */
+.qr-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.qr-modal.hidden { display: none !important; }
+.qr-modal-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0,0,0,0.65);
+  backdrop-filter: blur(3px);
+}
+.qr-modal-box {
+  position: relative;
+  background: var(--bg-elev);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  min-width: 480px;
+  box-shadow: 0 8px 40px rgba(0,0,0,0.5);
+}
+.qr-modal-header {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.qr-modal-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--fg);
+}
+#qr-canvas-wrap {
+  background: #fff;
+  border-radius: 6px;
+  padding: 10px;
+  line-height: 0;
+}
+.qr-modal-url {
+  font-size: 11px;
+  max-width: 460px;
+  word-break: break-all;
+  text-align: center;
 }
