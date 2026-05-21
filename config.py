@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -167,3 +169,37 @@ def prepare_profile_dir(*, profile_dir: Path, template_dir: Path, use_template: 
         return True
     profile_dir.mkdir(parents=True, exist_ok=True)
     return False
+
+
+# ─── TLS security helpers ────────────────────────────────────────────
+
+
+_INSECURE_TLS_ENV = "GPT_SIGNUP_INSECURE_TLS"
+_warned_scopes: set[str] = set()
+
+
+def env_insecure_tls() -> bool:
+    """Đọc env GPT_SIGNUP_INSECURE_TLS → bool. Default False (secure).
+
+    Bật qua env (1/true/yes/on) hoặc CLI flag truyền tay. Không có default
+    insecure ở bất cứ đâu — chỉ opt-in.
+    """
+    raw = os.environ.get(_INSECURE_TLS_ENV, "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def warn_insecure_tls(scope: str) -> None:
+    """In cảnh báo loud khi 1 phase đang chạy với TLS verify off.
+
+    Idempotent per-process per-scope: chỉ log lần đầu mỗi scope để không spam.
+    """
+    if scope in _warned_scopes:
+        return
+    _warned_scopes.add(scope)
+    msg = (
+        f"[security] TLS verification DISABLED for {scope!r} — "
+        f"debug/local-dev only. Set {_INSECURE_TLS_ENV}=0 or remove --insecure-tls "
+        f"to restore secure default."
+    )
+    print(msg, file=sys.stderr)
+    warnings.warn(msg, RuntimeWarning, stacklevel=2)

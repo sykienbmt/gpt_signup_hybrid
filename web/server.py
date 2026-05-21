@@ -11,6 +11,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from .auth import get_token  # legacy — token auth disabled
 from .manager import get_manager, get_session_manager, get_link_manager
 from .mail_modes import get_registry, serialize_for_api
 
@@ -27,7 +28,11 @@ def _asset_version() -> str:
     return str(latest_mtime or 1)
 
 
-app = FastAPI(title="gpt_signup_hybrid web UI", version="1.0.2")
+app = FastAPI(title="gpt_signup_hybrid web UI", version="0.1.0")
+
+
+# ─── Auth middleware (disabled) ───────────────────────────────────────
+# Token auth đã tắt — truy cập trực tiếp không cần token.
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -87,6 +92,17 @@ async def list_jobs() -> JSONResponse:
         "proxy": manager.proxy,
         "jobs": manager.list_jobs(),
     })
+
+
+@app.get("/api/jobs/secrets")
+async def get_jobs_secrets() -> JSONResponse:
+    """Trả secrets (password/secret/first_code/session_path) cho mọi job.
+
+    Auth gate đã cover bởi middleware. Endpoint riêng để list jobs default
+    không leak secrets nếu caller chỉ subscribe SSE.
+    """
+    manager = get_manager()
+    return JSONResponse({"secrets": manager.get_secrets_map()})
 
 
 @app.get("/api/jobs/{job_id}")
@@ -211,6 +227,9 @@ async def set_config(payload: SetConfigRequest) -> JSONResponse:
             raise HTTPException(400, str(exc))
     if payload.proxy is not None:
         manager.set_proxy(payload.proxy)
+        # Lan proxy global sang Session + Link manager (single source of truth)
+        get_session_manager().set_proxy(payload.proxy)
+        get_link_manager().set_proxy(payload.proxy)
     if payload.post_reg_get_session is not None:
         manager.set_post_reg_get_session(payload.post_reg_get_session)
     if payload.post_reg_get_link is not None:
@@ -412,6 +431,10 @@ class AddSessionJobsRequest(BaseModel):
 class SetSessionConfigRequest(BaseModel):
     max_concurrent: int | None = Field(default=None, ge=1, le=10)
     job_timeout: float | None = Field(default=None, ge=30, le=600)
+    proxy: str | None = Field(
+        default=None,
+        description="HTTP/HTTPS proxy URL. Empty string = direct.",
+    )
 
 
 @app.get("/api/session/jobs")
@@ -420,6 +443,7 @@ async def list_session_jobs() -> JSONResponse:
     return JSONResponse({
         "max_concurrent": sm.max_concurrent,
         "job_timeout": sm.job_timeout,
+        "proxy": sm.proxy,
         "jobs": sm.list_jobs(),
     })
 
@@ -487,6 +511,7 @@ async def get_session_config() -> JSONResponse:
     return JSONResponse({
         "max_concurrent": sm.max_concurrent,
         "job_timeout": sm.job_timeout,
+        "proxy": sm.proxy,
     })
 
 
@@ -503,9 +528,12 @@ async def set_session_config(payload: SetSessionConfigRequest) -> JSONResponse:
             sm.set_job_timeout(payload.job_timeout)
         except ValueError as exc:
             raise HTTPException(400, str(exc))
+    if payload.proxy is not None:
+        sm.set_proxy(payload.proxy)
     return JSONResponse({
         "max_concurrent": sm.max_concurrent,
         "job_timeout": sm.job_timeout,
+        "proxy": sm.proxy,
     })
 
 
@@ -521,6 +549,7 @@ async def session_events(request: Request) -> StreamingResponse:
                 "type": "snapshot",
                 "max_concurrent": sm.max_concurrent,
                 "job_timeout": sm.job_timeout,
+                "proxy": sm.proxy,
                 "jobs": sm.list_jobs(),
             }
             yield f"data: {json.dumps(snapshot)}\n\n"
@@ -559,6 +588,20 @@ async def session_events(request: Request) -> StreamingResponse:
 class AddLinkJobsRequest(BaseModel):
     combos: str = Field(..., description="Input text — format depends on mode")
     mode: str = Field(default="combo", description="combo | session_json | access_token")
+    region: str = Field(default="VN", description="Region: VN | ID | IN | US")
+
+
+class SetLinkConfigRequest(BaseModel):
+    max_concurrent: int | None = Field(default=None, ge=1, le=10)
+    job_timeout: float | None = Field(default=None, ge=30, le=600)
+    proxy: str | None = Field(
+        default=None,
+        description="HTTP/HTTPS proxy URL. Empty string = direct.",
+    )
+    region: str | None = Field(
+        default=None,
+        description="Region: VN | ID | IN | US",
+    )
 
 
 @app.post("/api/link/jobs")
@@ -566,16 +609,65 @@ async def add_link_jobs(payload: AddLinkJobsRequest) -> JSONResponse:
     mode = payload.mode
     if mode not in ("combo", "session_json", "access_token"):
         raise HTTPException(400, f"invalid mode: {mode}")
+    region = payload.region.upper()
+    from ..payment_link import REGION_BILLING
+    if region not in REGION_BILLING:
+        raise HTTPException(400, f"invalid region: {payload.region}. Must be one of: {list(REGION_BILLING.keys())}")
     lines = payload.combos.splitlines()
     lm = get_link_manager()
-    jobs = lm.add_jobs(lines, mode=mode)  # type: ignore[arg-type]
+    jobs = lm.add_jobs(lines, mode=mode, region=region)  # type: ignore[arg-type]
     return JSONResponse({"added": len(jobs), "jobs": [j.to_dict() for j in jobs]})
 
 
 @app.get("/api/link/jobs")
 async def list_link_jobs() -> JSONResponse:
     lm = get_link_manager()
-    return JSONResponse({"jobs": lm.list_jobs()})
+    return JSONResponse({
+        "max_concurrent": lm.max_concurrent,
+        "job_timeout": lm.job_timeout,
+        "proxy": lm.proxy,
+        "region": lm.region,
+        "jobs": lm.list_jobs(),
+    })
+
+
+@app.get("/api/link/config")
+async def get_link_config() -> JSONResponse:
+    lm = get_link_manager()
+    return JSONResponse({
+        "max_concurrent": lm.max_concurrent,
+        "job_timeout": lm.job_timeout,
+        "proxy": lm.proxy,
+        "region": lm.region,
+    })
+
+
+@app.post("/api/link/config")
+async def set_link_config(payload: SetLinkConfigRequest) -> JSONResponse:
+    lm = get_link_manager()
+    if payload.max_concurrent is not None:
+        try:
+            lm.set_max_concurrent(payload.max_concurrent)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+    if payload.job_timeout is not None:
+        try:
+            lm.set_job_timeout(payload.job_timeout)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+    if payload.proxy is not None:
+        lm.set_proxy(payload.proxy)
+    if payload.region is not None:
+        try:
+            lm.set_region(payload.region.upper())
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+    return JSONResponse({
+        "max_concurrent": lm.max_concurrent,
+        "job_timeout": lm.job_timeout,
+        "proxy": lm.proxy,
+        "region": lm.region,
+    })
 
 
 @app.post("/api/link/jobs/stop-all")
@@ -634,6 +726,8 @@ async def link_events(request: Request) -> StreamingResponse:
                 "type": "snapshot",
                 "max_concurrent": lm.max_concurrent,
                 "job_timeout": lm.job_timeout,
+                "proxy": lm.proxy,
+                "region": lm.region,
                 "jobs": lm.list_jobs(),
             }
             yield f"data: {json.dumps(snapshot)}\n\n"

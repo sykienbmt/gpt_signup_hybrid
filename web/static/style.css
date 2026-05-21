@@ -482,7 +482,8 @@ body {
 }
 
 .input-group input[type="text"],
-.input-group input[type="number"] {
+.input-group input[type="number"],
+.input-group select {
   background: var(--bg-elev-2);
   color: var(--fg);
   border: 1px solid var(--border);
@@ -497,8 +498,19 @@ body {
   box-sizing: border-box;
 }
 
+.input-group select {
+  cursor: pointer;
+  -webkit-appearance: none;
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' fill='%238a93a0'%3E%3Cpath d='M0 0l5 6 5-6z'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  padding-right: 28px;
+}
+
 .input-group input[type="text"]:focus,
-.input-group input[type="number"]:focus {
+.input-group input[type="number"]:focus,
+.input-group select:focus {
   border-color: var(--accent);
   box-shadow: var(--focus-ring);
 }
@@ -598,7 +610,7 @@ body {
 
 .job {
   display: grid;
-  grid-template-columns: auto 1fr auto auto;
+  grid-template-columns: auto auto 1fr auto auto;
   align-items: center;
   gap: 12px;
   padding: 10px 12px;
@@ -617,6 +629,16 @@ body {
 .job.is-active {
   background: var(--bg-elev-2);
   border-color: var(--accent);
+}
+
+.job-index {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--fg-dim);
+  min-width: 22px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  user-select: none;
 }
 
 .job-status {

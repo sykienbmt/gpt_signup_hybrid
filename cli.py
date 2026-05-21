@@ -17,7 +17,7 @@ from pathlib import Path
 
 import typer
 
-from .config import load_settings, runtime_session_dir
+from .config import env_insecure_tls, load_settings, runtime_session_dir
 from .models import SignupRequest, SignupResult
 from .signup import run_signup
 
@@ -159,12 +159,81 @@ def enable_2fa_cmd(
     }, indent=2, ensure_ascii=False))
 
 
+@app.command("migrate")
+def migrate_cmd(
+    state_dir: Path = typer.Option(
+        "runtime/outlook_state",
+        "--state-dir",
+        help="Thư mục chứa outlook state JSON files.",
+    ),
+    sessions_dir: Path = typer.Option(
+        "runtime/sessions",
+        "--sessions-dir",
+        help="Thư mục chứa session result JSON files.",
+    ),
+    db_path: str = typer.Option(
+        "runtime/data.db",
+        "--db-path",
+        help="Đường dẫn tới SQLite database file.",
+    ),
+) -> None:
+    """Migrate JSON state files (outlook_state + sessions) sang SQLite database."""
+    from .db import get_engine, get_repos
+    from .db.migrate import MigrationTool
+
+    engine = get_engine(db_path)
+    combo_repo, _job_repo, session_repo = get_repos(engine)
+    tool = MigrationTool(engine, combo_repo, session_repo)
+
+    # Migrate outlook state
+    outlook_summary = tool.migrate_outlook_state(Path(state_dir))
+    # Migrate sessions
+    sessions_summary = tool.migrate_sessions(Path(sessions_dir))
+
+    # Print summary per entity type
+    for summary in (outlook_summary, sessions_summary):
+        typer.echo(
+            f"[migrate] {summary.entity_type}: "
+            f"total={summary.total_files} "
+            f"inserted={summary.inserted} "
+            f"skipped_duplicate={summary.skipped_duplicate} "
+            f"skipped_error={summary.skipped_error}"
+        )
+
+
+@app.command("import-pool")
+def import_pool_cmd(
+    pool_file: Path = typer.Argument(..., help="Path tới pool file (format: email|password|refresh_token|client_id)."),
+    db_path: str = typer.Option(
+        "runtime/data.db",
+        "--db-path",
+        help="Đường dẫn tới SQLite database file.",
+    ),
+) -> None:
+    """Import pool file vào SQLite database (upsert outlook_combos)."""
+    from .db import get_engine, get_repos
+    from .db.migrate import MigrationTool
+
+    engine = get_engine(db_path)
+    combo_repo, _job_repo, session_repo = get_repos(engine)
+    tool = MigrationTool(engine, combo_repo, session_repo)
+
+    summary = tool.import_pool_file(Path(pool_file))
+
+    typer.echo(
+        f"[import-pool] total_lines={summary.total_lines} "
+        f"inserted={summary.inserted} "
+        f"updated={summary.updated} "
+        f"skipped={summary.skipped}"
+    )
+
+
 # Workaround: Typer thu gọn invoke khi chỉ có 1 command. Đăng ký một no-op
 # command thứ hai để giữ form `python -m gpt_signup_hybrid signup ...`.
 @app.command("version", hidden=True)
 def _version_cmd() -> None:
     """Print package version (hidden helper)."""
-    typer.echo("gpt_signup_hybrid 1.0.2")
+    typer.echo("gpt_signup_hybrid 0.1.0")
 
 
 @app.command("web")
@@ -172,6 +241,12 @@ def web_cmd(
     host: str = typer.Option("127.0.0.1", "--host", help="Bind host."),
     port: int = typer.Option(8089, "--port", help="Bind port."),
     reload: bool = typer.Option(False, "--reload", help="Auto-reload (dev mode)."),
+    unsafe_expose_network: bool = typer.Option(
+        False,
+        "--unsafe-expose-network",
+        help="Cho phép bind non-loopback host (LAN/0.0.0.0). Yêu cầu vì web UI "
+             "trả secret-bearing job state — phải ý thức rủi ro.",
+    ),
 ) -> None:
     """Start web UI server tại http://<host>:<port>/.
 
@@ -184,6 +259,18 @@ def web_cmd(
     import sys
     import uvicorn
 
+
+    # ── Bind safety: chặn non-loopback nếu chưa opt-in ──
+    is_loopback = host in {"127.0.0.1", "localhost", "::1"}
+    if not is_loopback and not unsafe_expose_network:
+        typer.echo(
+            f"[web] refuse bind to non-loopback host {host!r}.\n"
+            f"      Web UI exposes credentials and job control without internet auth.\n"
+            f"      Re-run với --unsafe-expose-network nếu bạn thật sự muốn.",
+            err=True,
+        )
+        raise typer.Exit(2)
+
     # Suppress ALL uvicorn/asyncio noise
     logging.getLogger("uvicorn").setLevel(logging.CRITICAL)
     logging.getLogger("uvicorn.error").setLevel(logging.CRITICAL)
@@ -191,6 +278,10 @@ def web_cmd(
     logging.getLogger("asyncio").setLevel(logging.CRITICAL)
 
     typer.echo(f"[web] starting at http://{host}:{port}/")
+    if not is_loopback:
+        typer.echo(
+            f"[web] WARNING: bind {host!r} — UI reachable từ LAN."
+        )
     typer.echo(f"[web] Ctrl+C to stop.\n")
 
     # Monkey-patch: khi nhận SIGINT, suppress stderr rồi exit clean
@@ -244,7 +335,11 @@ def signup_cmd(
         help="[worker] Worker logs URL.",
     ),
     api_key: str = typer.Option("12345678@", "--api-key", help="[worker] Bearer cho Worker."),
-    insecure_tls: bool = typer.Option(True, "--insecure-tls/--secure-tls", help="[worker] Bỏ verify TLS."),
+    insecure_tls: bool = typer.Option(
+        False,
+        "--insecure-tls/--secure-tls",
+        help="[worker] Bỏ verify TLS (debug only). Default = secure.",
+    ),
     # Outlook provider opts
     outlook_combo: str | None = typer.Option(
         None, "--outlook-combo",
@@ -263,6 +358,11 @@ def signup_cmd(
     off_font: bool = typer.Option(False, "--off-font", help="Tắt camoufox font randomization."),
     profile_template: bool = typer.Option(True, "--profile-template/--fresh-profile"),
     proxy: str | None = typer.Option(None, "--proxy", help="HTTP/HTTPS proxy."),
+    browser_tls_insecure: bool = typer.Option(
+        False,
+        "--browser-tls-insecure/--browser-tls-secure",
+        help="Bỏ TLS verify cho browser context (debug only). Default = secure.",
+    ),
     # Timing
     otp_timeout: float = typer.Option(180.0, "--otp-timeout", min=10),
     otp_interval: float = typer.Option(4.0, "--otp-interval", min=0.5),
@@ -355,6 +455,7 @@ def signup_cmd(
         off_font=off_font,
         profile_template=profile_template,
         proxy=proxy,
+        tls_insecure=browser_tls_insecure or env_insecure_tls(),
         otp_timeout_seconds=otp_timeout,
         otp_poll_interval_seconds=otp_interval,
         sentinel_cookie_timeout_seconds=sentinel_timeout,

@@ -1,6 +1,10 @@
-/* gpt_signup_hybrid — frontend logic */
+﻿/* gpt_signup_hybrid — frontend logic */
 (() => {
   'use strict';
+
+  // ── Auth (disabled — no token required) ────────────────────────────
+  function getAuthToken() { return ''; }
+  function withTokenQuery(url) { return url; }
 
   // ── LocalStorage keys ─────────────────────────────────────────────
   const LS_MODE = 'gpt_reg.mail_mode';
@@ -117,13 +121,18 @@
   }
 
   function api(path, opts = {}) {
+    const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) };
     return fetch(path, {
-      headers: { 'Content-Type': 'application/json' },
       ...opts,
+      headers,
     }).then((r) => {
       if (!r.ok) return r.text().then((t) => { throw new Error(`HTTP ${r.status}: ${t}`); });
       return r.json();
     });
+  }
+
+  function authEventSource(url) {
+    return new EventSource(url);
   }
 
   function icon(name) {
@@ -162,6 +171,8 @@
     copyText,
     activateTab,
     initTabs,
+    getAuthToken,
+    authEventSource,
   });
 
   // ── Combo counter ─────────────────────────────────────────────────
@@ -184,7 +195,7 @@
     }
 
     const stats = { queued: 0, running: 0, success: 0, error: 0, cancelled: 0 };
-    const html = state.order.map((id) => {
+    const html = state.order.map((id, idx) => {
       const j = state.jobs.get(id);
       if (!j) return '';
       stats[j.status] = (stats[j.status] || 0) + 1;
@@ -202,6 +213,7 @@
       }
       return `
         <div class="${cls}" data-id="${escHtml(id)}">
+          <div class="job-index">${idx + 1}</div>
           <div class="job-status status-${escHtml(j.status)}">${escHtml(j.status)}</div>
           <div class="job-main">
             <div class="job-email" title="${escHtml(j.email)}">${escHtml(j.email)}<span class="badge-mode badge-mode-${escHtml(j.mail_mode || 'outlook')}">${escHtml(j.mail_mode || 'outlook')}</span></div>
@@ -259,6 +271,35 @@
   });
 
   // ── Render success/error output ──────────────────────────────────
+  // Secrets không còn nằm trong job snapshot — fetch riêng qua /api/jobs/secrets.
+  // Cache local để tránh round-trip mỗi render; refresh khi snapshot/SSE-job update.
+  const secretsCache = new Map(); // job_id → {password, secret, first_code, session_path}
+  let _secretsRefreshScheduled = false;
+
+  async function refreshSecrets() {
+    try {
+      const data = await api('/api/jobs/secrets');
+      secretsCache.clear();
+      const map = data.secrets || {};
+      for (const id of Object.keys(map)) {
+        secretsCache.set(id, map[id] || {});
+      }
+      renderOutputs();
+    } catch (err) {
+      console.warn('refreshSecrets failed', err.message);
+    }
+  }
+
+  function scheduleSecretsRefresh() {
+    if (_secretsRefreshScheduled) return;
+    _secretsRefreshScheduled = true;
+    // Coalesce nhiều SSE update gần nhau — fetch 1 lần sau 250ms
+    setTimeout(() => {
+      _secretsRefreshScheduled = false;
+      refreshSecrets();
+    }, 250);
+  }
+
   function renderOutputs() {
     const successLines = [];
     const errorLines = [];
@@ -584,8 +625,13 @@
     state.order = jobs.map((j) => j.id);
     state.jobs.clear();
     for (const j of jobs) state.jobs.set(j.id, j);
+    // Prune secretsCache theo job set hiện tại
+    for (const cachedId of Array.from(secretsCache.keys())) {
+      if (!state.jobs.has(cachedId)) secretsCache.delete(cachedId);
+    }
     renderJobs();
     renderOutputs();
+    scheduleSecretsRefresh();
   }
 
   function applyJobUpdate(j) {
@@ -595,6 +641,10 @@
     state.jobs.set(j.id, j);
     renderJobs();
     renderOutputs();
+    // Khi job chuyển success/error → có thể có secrets mới → fetch lại
+    if (j.status === 'success' || j.status === 'error') {
+      scheduleSecretsRefresh();
+    }
     if (state.activeJobId === j.id) {
       // refresh log nếu đang xem
       renderLog(j.id);
@@ -604,6 +654,7 @@
   function applyRemove(jobId) {
     state.jobs.delete(jobId);
     state.order = state.order.filter((id) => id !== jobId);
+    secretsCache.delete(jobId);
     if (state.activeJobId === jobId) {
       state.activeJobId = null;
       renderLog(null);
@@ -623,7 +674,7 @@
   }
 
   function connectSSE() {
-    const es = new EventSource('/api/events');
+    const es = authEventSource('/api/events');
     es.onmessage = (e) => {
       try {
         const data = JSON.parse(e.data);

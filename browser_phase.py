@@ -33,6 +33,13 @@ from urllib.parse import parse_qs, urlparse
 from .config import Settings, ensure_runtime_dirs, prepare_profile_dir
 from .mail_providers import MailProvider
 from .models import BrowserHandoff, SignupRequest
+from ._nextauth_bootstrap import bootstrap_authorize_url
+from ._browser_retry import (
+    DRIVER_DEAD_MARKERS as _DRIVER_DEAD_MARKERS,
+    LAUNCH_RETRY_BACKOFF as _LAUNCH_RETRY_BACKOFF,
+    LAUNCH_RETRY_MAX as _LAUNCH_RETRY_MAX,
+    is_driver_dead_error as _is_driver_dead_error,
+)
 
 
 class BrowserPhaseError(Exception):
@@ -50,41 +57,6 @@ _REQUIRED_AUTH_COOKIES = (
 # ─────────────────────────────────────────────────────────────────────
 # JS helpers
 # ─────────────────────────────────────────────────────────────────────
-
-_NEXTAUTH_BOOTSTRAP_JS = r"""
-async ({email, deviceId, loggingId}) => {
-    const params = new URLSearchParams({
-        'prompt': 'login',
-        'ext-oai-did': deviceId,
-        'auth_session_logging_id': loggingId,
-        'ext-passkey-client-capabilities': '0100',
-        'screen_hint': 'login_or_signup',
-        'login_hint': email,
-    }).toString();
-
-    const csrfRes = await fetch('/api/auth/csrf', {credentials: 'include'});
-    if (!csrfRes.ok) throw new Error('csrf HTTP ' + csrfRes.status);
-    const csrfData = await csrfRes.json();
-    const csrfToken = csrfData.csrfToken;
-    if (!csrfToken) throw new Error('csrf token missing');
-
-    const body = new URLSearchParams({
-        callbackUrl: 'https://chatgpt.com/',
-        csrfToken,
-        json: 'true',
-    }).toString();
-    const signRes = await fetch('/api/auth/signin/openai?' + params, {
-        method: 'POST',
-        credentials: 'include',
-        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-        body,
-    });
-    if (!signRes.ok) throw new Error('signin HTTP ' + signRes.status);
-    const signData = await signRes.json();
-    if (!signData.url) throw new Error('signin missing url: ' + JSON.stringify(signData));
-    return signData.url;
-}
-"""
 
 # JS: POST /api/accounts/user/register trên auth.openai.com page context
 _REGISTER_USER_JS = r"""
@@ -134,12 +106,12 @@ async ({name, birthdate}) => {
 async def _bootstrap_oauth_url(page, *, email: str, device_id: str, logging_id: str, log) -> str:
     """Gọi /api/auth/csrf + POST /signin/openai trong page context chatgpt.com."""
     log("[browser] bootstrapping NextAuth (csrf + signin)...")
-    url = await page.evaluate(
-        _NEXTAUTH_BOOTSTRAP_JS,
-        {"email": email, "deviceId": device_id, "loggingId": logging_id},
+    url = await bootstrap_authorize_url(
+        page,
+        email=email,
+        device_id=device_id,
+        logging_id=logging_id,
     )
-    if not isinstance(url, str) or "auth.openai.com" not in url:
-        raise BrowserPhaseError(f"bootstrap returned bad URL: {url!r}")
     log(f"[browser] authorize URL ready: {url[:120]}...")
     return url
 
@@ -394,6 +366,7 @@ async def _drive_signup_flow(
     continue_clicked = False
     otp_submitted = False
     tried_codes: set[str] = set()  # codes đã submit + bị reject
+    pending_codes: list[str] = []  # codes chưa submit (mail delay catch)
     last_screen = None
     same_screen_count = 0
 
@@ -489,13 +462,30 @@ async def _drive_signup_flow(
             continue
 
         if screen == "otp":
-            # Detect "incorrect code" error → resend email + poll code mới
+            # Detect "incorrect code" error → thử code kế (nếu có) hoặc resend + poll
             try:
                 err_el = page.locator('[role="alert"], [class*="error"]').first
                 err_text = await err_el.text_content(timeout=200)
                 if err_text and any(k in err_text.lower() for k in ("incorrect", "wrong", "invalid", "expired")):
+                    # Clear input trước
+                    try:
+                        otp_inp = page.locator('input[name="code"]').first
+                        await otp_inp.fill("")
+                    except Exception:
+                        pass
+                    # Nếu còn pending code (mail delay) → thử ngay, không resend
+                    if pending_codes:
+                        next_code = pending_codes.pop(0)
+                        log(f"[flow] OTP rejected: {err_text.strip()[:60]} — thử code kế: {next_code}")
+                        otp_selector = await _wait_otp_form(page, timeout_seconds=5.0, log=log)
+                        await _submit_otp(page, otp_code=next_code, otp_selector=otp_selector, log=log)
+                        tried_codes.add(next_code)
+                        otp_submitted = True
+                        same_screen_count = 0
+                        await asyncio.sleep(2.0)
+                        continue
+                    # Không còn pending → resend
                     log(f"[flow] OTP rejected: {err_text.strip()[:80]} — resend email & poll lại")
-                    # Click "Resend email" để trigger mail mới
                     try:
                         resend_btn = page.locator('button:has-text("Resend"), a:has-text("Resend")').first
                         await resend_btn.click(timeout=3000)
@@ -505,12 +495,6 @@ async def _drive_signup_flow(
                     # Reset state để poll code mới
                     otp_submitted = False
                     same_screen_count = 0
-                    # Clear input
-                    try:
-                        otp_inp = page.locator('input[name="code"]').first
-                        await otp_inp.fill("")
-                    except Exception:
-                        pass
                     await asyncio.sleep(2.0)
             except Exception:
                 pass
@@ -551,22 +535,88 @@ async def _drive_signup_flow(
             recipient = request.source_email or request.email
             log(f"[flow] polling OTP (recipient={recipient}) since {poll_started.isoformat()}")
             
-            # Poll OTP, skip codes đã thử
+            # Poll OTP, skip codes đã thử.
+            # Nếu đợi >30s chưa có code mới → click Resend rồi poll tiếp.
+            # iCloud có thể gửi mail mới trước, mail cũ delay → lấy nhiều codes
+            # rồi thử lần lượt trước khi resend.
+            resend_after_seconds = 30.0
+            resend_count = 0
+            max_resends = 3  # tối đa resend 3 lần trong 1 lượt OTP
+            stale_poll_count = 0  # đếm lần poll liên tiếp chỉ nhận code cũ
+            stale_poll_resend_threshold = 5  # sau 5 lần poll chỉ code cũ → resend
             while True:
-                otp_code = await mail_provider.poll_otp(
-                    recipient=recipient,
-                    started_at=poll_started,
-                    timeout_seconds=request.otp_timeout_seconds,
-                    poll_interval_seconds=request.otp_poll_interval_seconds,
-                    log=log,
-                )
-                if otp_code not in tried_codes:
+                # Nếu có codes pending chưa submit → thử từng cái
+                if pending_codes:
+                    otp_code = pending_codes.pop(0)
                     break
-                log(f"[flow] OTP={otp_code} đã thử rồi, skip và poll tiếp")
-                await asyncio.sleep(request.otp_poll_interval_seconds)
-                # Nếu poll_otp timeout → raise, không loop vô hạn
-                if time.monotonic() - t_otp > request.otp_timeout_seconds:
+                remaining = request.otp_timeout_seconds - (time.monotonic() - t_otp)
+                if remaining <= 0:
                     raise BrowserPhaseError(f"OTP timeout {request.otp_timeout_seconds}s, chỉ nhận được codes cũ")
+                # Poll với mini-timeout = min(resend_after_seconds, remaining)
+                mini_timeout = min(resend_after_seconds, remaining)
+                try:
+                    otp_code = await mail_provider.poll_otp(
+                        recipient=recipient,
+                        started_at=poll_started,
+                        timeout_seconds=mini_timeout,
+                        poll_interval_seconds=request.otp_poll_interval_seconds,
+                        log=log,
+                    )
+                except Exception:
+                    # Timeout thật — không nhận được code nào trong mini_timeout
+                    otp_code = None
+                if otp_code and otp_code not in tried_codes:
+                    # Nhận code mới → fetch lại tất cả codes để catch mail delay
+                    await asyncio.sleep(3.0)
+                    all_codes: list[str] = []
+                    if hasattr(mail_provider, 'poll_all_codes'):
+                        all_codes = await mail_provider.poll_all_codes(
+                            recipient=recipient,
+                            started_at=poll_started,
+                            log=log,
+                        )
+                    # Lọc codes chưa thử, giữ thứ tự
+                    new_codes = [c for c in all_codes if c not in tried_codes]
+                    if not new_codes:
+                        new_codes = [otp_code]
+                    elif otp_code not in new_codes:
+                        new_codes.insert(0, otp_code)
+                    if len(new_codes) > 1:
+                        log(f"[flow] got {len(new_codes)} OTP codes: {', '.join(new_codes)}")
+                    pending_codes = new_codes
+                    continue  # loop lại → pop từ pending_codes
+                if otp_code and otp_code in tried_codes:
+                    # Code cũ quay lại — đếm, sau N lần → resend
+                    stale_poll_count += 1
+                    if stale_poll_count >= stale_poll_resend_threshold and resend_count < max_resends:
+                        resend_count += 1
+                        stale_poll_count = 0
+                        log(f"[flow] poll {stale_poll_resend_threshold} lần chỉ code cũ — click Resend ({resend_count}/{max_resends})")
+                        try:
+                            resend_btn = page.locator('button:has-text("Resend"), a:has-text("Resend")').first
+                            await resend_btn.click(timeout=3000)
+                            log("[flow] clicked 'Resend email'")
+                        except Exception as exc:
+                            log(f"[flow] resend button not found: {exc}")
+                        await asyncio.sleep(2.0)
+                        poll_started = datetime.now(timezone.utc).replace(microsecond=0)
+                    else:
+                        log(f"[flow] OTP={otp_code} đã thử rồi, tiếp tục poll... ({stale_poll_count}/{stale_poll_resend_threshold})")
+                        await asyncio.sleep(request.otp_poll_interval_seconds)
+                    continue
+                # otp_code is None → timeout thật sự, không code nào về → resend
+                if resend_count < max_resends:
+                    resend_count += 1
+                    log(f"[flow] OTP chưa nhận sau {mini_timeout:.0f}s — click Resend ({resend_count}/{max_resends})")
+                    try:
+                        resend_btn = page.locator('button:has-text("Resend"), a:has-text("Resend")').first
+                        await resend_btn.click(timeout=3000)
+                        log("[flow] clicked 'Resend email'")
+                    except Exception as exc:
+                        log(f"[flow] resend button not found: {exc}")
+                    # Reset poll_started để chỉ nhận code mới sau resend
+                    await asyncio.sleep(2.0)
+                    poll_started = datetime.now(timezone.utc).replace(microsecond=0)
             
             otp_seconds_total += time.monotonic() - t_otp
             log(f"[flow] OTP={otp_code} got in {time.monotonic() - t_otp:.1f}s")
@@ -917,6 +967,11 @@ async def run_browser_phase(
 
     Returns: (handoff, otp_seconds).
     """
+    if request.tls_insecure:
+        from .config import warn_insecure_tls
+        warn_insecure_tls("browser_phase")
+        log("[security] TLS verification DISABLED — debug mode")
+
     engine = settings.browser_engine or "chrome"
     job_id = f"hybrid_{uuid.uuid4().hex[:10]}"
 
@@ -961,8 +1016,18 @@ async def run_browser_phase(
     handoff_cookies: list[dict[str, Any]] = []
     authorize_url: str | None = None
     otp_seconds = 0.0
+    callback_url: str | None = None
 
-    if engine == "camoufox":
+    # Track xem có đã chạm mốc OTP poll chưa. Sau mốc này, KHÔNG retry kể cả
+    # khi driver chết — vì OTP đã được gửi, retry sẽ gây gửi OTP lần 2 và
+    # consume mã không cần thiết.
+    flow_progress = {"otp_started": False}
+
+    def _mark_otp_started() -> None:
+        flow_progress["otp_started"] = True
+
+    # ─── Inner runners (mỗi runner là 1 lần launch + drive flow) ───
+    async def _run_camoufox_once() -> tuple[str, float, str, list[dict[str, Any]]]:
         from camoufox.async_api import AsyncCamoufox
         from camoufox.utils import Screen as _Screen
 
@@ -986,14 +1051,13 @@ async def run_browser_phase(
             user_data_dir=str(profile_dir),
             viewport=viewport,
             screen=fixed_screen,
-            ignore_https_errors=True,
+            ignore_https_errors=request.tls_insecure,
             config=extra_config,
             **proxy_kwargs,
             **har_kwargs,
         )
         ctx = await cf.__aenter__()
 
-        # Capture callback URL
         callback_holder: dict[str, str] = {}
 
         def _capture_callback(req) -> None:
@@ -1005,21 +1069,18 @@ async def run_browser_phase(
         try:
             page = ctx.pages[0] if ctx.pages else await ctx.new_page()
 
-            # ── Step 1: bootstrap ──
             await page.goto("https://chatgpt.com/", wait_until="domcontentloaded")
             log("[browser] chatgpt.com loaded")
-            authorize_url = await _bootstrap_oauth_url(
+            _authorize_url = await _bootstrap_oauth_url(
                 page, email=request.email, device_id=device_id, logging_id=logging_id, log=log,
             )
-
-            # ── Step 2: navigate authorize → /email-verification ──
-            await page.goto(authorize_url, wait_until="domcontentloaded")
+            await page.goto(_authorize_url, wait_until="domcontentloaded")
             await asyncio.sleep(1.0)
 
-            # ── Step 3: state-machine driver ──
-            # Auto-detect screen (password_create/password_login/otp/about_you/chatgpt)
-            # và dispatch handler tương ứng cho đến khi đến chatgpt.com
-            callback_url, otp_seconds = await _drive_signup_flow(
+            # Mốc check-point: sắp drive flow (sẽ trigger OTP send).
+            _mark_otp_started()
+
+            _callback_url, _otp_seconds = await _drive_signup_flow(
                 ctx=ctx, page=page, request=request,
                 mail_provider=mail_provider,
                 callback_holder=callback_holder,
@@ -1027,13 +1088,12 @@ async def run_browser_phase(
                 log=log,
             )
 
-            # ── Exfil ──
-            state_param = (
-                _extract_state_from_authorize(authorize_url)
+            _state = (
+                _extract_state_from_authorize(_authorize_url)
                 or await _extract_state_from_url(page, log=log)
             )
-            handoff_cookies = await ctx.cookies()
-
+            _cookies = await ctx.cookies()
+            return _callback_url, _otp_seconds, _state or "", _cookies
         finally:
             try:
                 ctx.remove_listener("request", _capture_callback)
@@ -1046,10 +1106,8 @@ async def run_browser_phase(
                     await cf.__aexit__(None, None, None)
                 except Exception:
                     pass
-                shutil.rmtree(profile_dir, ignore_errors=True)
 
-    else:
-        # Chromium fallback (playwright)
+    async def _run_chromium_once() -> tuple[str, float, str, list[dict[str, Any]]]:
         from playwright.async_api import async_playwright
 
         playwright = await async_playwright().start()
@@ -1060,7 +1118,7 @@ async def run_browser_phase(
                 headless=request.headless,
                 channel=channel,
                 viewport=viewport,
-                ignore_https_errors=True,
+                ignore_https_errors=request.tls_insecure,
                 **proxy_kwargs,
                 **har_kwargs,
             )
@@ -1077,18 +1135,16 @@ async def run_browser_phase(
             page = ctx.pages[0] if ctx.pages else await ctx.new_page()
             await page.goto("https://chatgpt.com/", wait_until="domcontentloaded")
             log("[browser] chatgpt.com loaded")
-            authorize_url = await _bootstrap_oauth_url(
+            _authorize_url = await _bootstrap_oauth_url(
                 page, email=request.email, device_id=device_id, logging_id=logging_id, log=log,
             )
-
-            # ── Step 2: navigate authorize → /email-verification ──
-            await page.goto(authorize_url, wait_until="domcontentloaded")
+            await page.goto(_authorize_url, wait_until="domcontentloaded")
             await asyncio.sleep(1.0)
 
-            # ── Step 3: state-machine driver ──
-            # Auto-detect screen (password_create/password_login/otp/about_you/chatgpt)
-            # và dispatch handler tương ứng cho đến khi đến chatgpt.com
-            callback_url, otp_seconds = await _drive_signup_flow(
+            # Mốc check-point: sắp drive flow (sẽ trigger OTP send).
+            _mark_otp_started()
+
+            _callback_url, _otp_seconds = await _drive_signup_flow(
                 ctx=ctx, page=page, request=request,
                 mail_provider=mail_provider,
                 callback_holder=callback_holder,
@@ -1096,21 +1152,80 @@ async def run_browser_phase(
                 log=log,
             )
 
-            # ── Exfil ──
-            state_param = (
-                _extract_state_from_authorize(authorize_url)
+            _state = (
+                _extract_state_from_authorize(_authorize_url)
                 or await _extract_state_from_url(page, log=log)
             )
-            handoff_cookies = await ctx.cookies()
+            _cookies = await ctx.cookies()
 
             if not (request.keep_browser_open and not request.headless):
                 await ctx.close()
+            return _callback_url, _otp_seconds, _state or "", _cookies
         finally:
             if request.keep_browser_open and not request.headless:
                 log("[browser] debug: giữ browser mở — cancel job để đóng")
             else:
                 await playwright.stop()
-                shutil.rmtree(profile_dir, ignore_errors=True)
+
+    runner = _run_camoufox_once if engine == "camoufox" else _run_chromium_once
+
+    # Vòng retry: chỉ retry khi bắt được lỗi driver-pipe-dead VÀ flow chưa
+    # tới mốc OTP send. Sau OTP send, lỗi driver vẫn fail-fast để tránh
+    # spam mã OTP cho user.
+    last_exc: BaseException | None = None
+    success = False
+    for attempt in range(1, _LAUNCH_RETRY_MAX + 1):
+        flow_progress["otp_started"] = False
+        try:
+            callback_url, otp_seconds, state_param, handoff_cookies = await runner()
+            success = True
+            last_exc = None
+            break
+        except BrowserPhaseError:
+            raise
+        except Exception as exc:
+            last_exc = exc
+            if not _is_driver_dead_error(exc):
+                raise BrowserPhaseError(
+                    f"browser launch/driver error: {type(exc).__name__}: {exc}"
+                ) from exc
+            if flow_progress["otp_started"]:
+                log(
+                    f"[browser] driver pipe đóng sau khi đã trigger OTP — "
+                    f"không retry để tránh gửi OTP lần 2: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                raise BrowserPhaseError(
+                    f"driver pipe chết giữa flow (OTP đã gửi, không retry): {exc}"
+                ) from exc
+            log(
+                f"[browser] driver pipe đóng sớm "
+                f"(attempt {attempt}/{_LAUNCH_RETRY_MAX}): "
+                f"{type(exc).__name__}: {exc}"
+            )
+            if attempt >= _LAUNCH_RETRY_MAX:
+                break
+            # Reset profile sạch trước khi retry — driver có thể đã ghi
+            # state lỗi vào profile.
+            shutil.rmtree(profile_dir, ignore_errors=True)
+            prepare_profile_dir(
+                profile_dir=profile_dir,
+                template_dir=template_dir,
+                use_template=request.profile_template,
+            )
+            await asyncio.sleep(_LAUNCH_RETRY_BACKOFF)
+
+    # Cleanup profile sau khi loop kết thúc (trừ debug mode keep_browser_open).
+    if not (request.keep_browser_open and not request.headless):
+        shutil.rmtree(profile_dir, ignore_errors=True)
+
+    if not success:
+        if last_exc is not None and _is_driver_dead_error(last_exc):
+            raise BrowserPhaseError(
+                f"driver pipe đóng sau {_LAUNCH_RETRY_MAX} lần thử: {last_exc}"
+            ) from last_exc
+        # Defensive: không bao giờ xảy ra (đã raise trong loop)
+        raise BrowserPhaseError("browser launch failed without specific error")
 
     if not state_param:
         raise BrowserPhaseError("không lấy được oauth state từ navigation history")

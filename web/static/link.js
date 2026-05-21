@@ -23,6 +23,7 @@
     activeJobId: null,
     maxConcurrent: 1,
     mode: 'combo',
+    region: 'VN',
   };
 
   const $ = (id) => document.getElementById(id);
@@ -36,6 +37,7 @@
     btnCopyError: $('link-btn-copy-error'),
     comboCount: $('link-combo-count'),
     jobTimeout: $('link-job-timeout'),
+    regionSelect: $('link-region-select'),
     jobList: $('link-job-list'),
     jobSummary: $('link-job-summary'),
     logPane: $('link-log-pane'),
@@ -70,9 +72,10 @@
   }
 
   function api(path, opts = {}) {
+    const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) };
     return fetch(path, {
-      headers: { 'Content-Type': 'application/json' },
       ...opts,
+      headers,
     }).then((r) => {
       if (!r.ok) return r.text().then((t) => { throw new Error(`HTTP ${r.status}: ${t}`); });
       return r.json();
@@ -115,7 +118,7 @@
     }
 
     const stats = { queued: 0, running: 0, success: 0, error: 0, cancelled: 0 };
-    const html = state.order.map((id) => {
+    const html = state.order.map((id, idx) => {
       const job = state.jobs.get(id);
       if (!job) return '';
 
@@ -150,6 +153,7 @@
 
       return `
         <div class="${cls}" data-id="${escHtml(id)}">
+          <div class="job-index">${idx + 1}</div>
           <div class="job-status status-${escHtml(job.status)}">${escHtml(job.status)}</div>
           <div class="job-main">
             <div class="job-email" title="${escHtml(job.email)}">${modeTag}${escHtml(job.email)}</div>
@@ -225,13 +229,17 @@
   }
 
   function connectSSE() {
-    const es = new EventSource('/api/link/events');
+    const es = window.GptUi.authEventSource('/api/link/events');
     es.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
         if (data.type === 'snapshot') {
           state.maxConcurrent = data.max_concurrent || state.maxConcurrent;
           if (data.job_timeout) dom.jobTimeout.value = data.job_timeout;
+          if (data.region) {
+            state.region = data.region;
+            dom.regionSelect.value = data.region;
+          }
           applySnapshot(data.jobs || []);
         } else if (data.type === 'job') {
           applyJobUpdate(data.job);
@@ -293,7 +301,7 @@
     try {
       await api('/api/link/jobs', {
         method: 'POST',
-        body: JSON.stringify({ combos, mode: state.mode }),
+        body: JSON.stringify({ combos, mode: state.mode, region: state.region }),
       });
     } catch (err) {
       alert('Error: ' + err.message);
@@ -317,6 +325,27 @@
 
   dom.btnCopyError.addEventListener('click', () => {
     window.GptUi.copyText(dom.errorPane.textContent);
+  });
+
+  dom.jobTimeout.addEventListener('change', async () => {
+    const val = parseInt(dom.jobTimeout.value, 10);
+    if (isNaN(val) || val < 30 || val > 600) return;
+    try {
+      await api('/api/link/config', {
+        method: 'POST',
+        body: JSON.stringify({ job_timeout: val }),
+      });
+    } catch (err) { console.error(err); }
+  });
+
+  dom.regionSelect.addEventListener('change', async () => {
+    state.region = dom.regionSelect.value;
+    try {
+      await api('/api/link/config', {
+        method: 'POST',
+        body: JSON.stringify({ region: state.region }),
+      });
+    } catch (err) { console.error(err); }
   });
 
   // ─── QR Modal ───

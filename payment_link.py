@@ -68,6 +68,15 @@ _STRIPE_INIT_URL_TPL = "https://api.stripe.com/v1/payment_pages/{session_id}/ini
 _CF_MARKERS = ("cf-chl", "just a moment", "cloudflare")
 _IMPERSONATE = "chrome136"
 
+# Region → billing_details mapping
+REGION_BILLING: dict[str, dict[str, str]] = {
+    "VN": {"country": "VN", "currency": "VND"},
+    "ID": {"country": "ID", "currency": "IDR"},
+    "IN": {"country": "IN", "currency": "INR"},
+    "US": {"country": "US", "currency": "USD"},
+}
+DEFAULT_REGION = "VN"
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -120,9 +129,12 @@ async def _call_chatgpt_checkout(
     session: AsyncSession,
     access_token: str,
     *,
+    region: str = DEFAULT_REGION,
     timeout: float = 30.0,
 ) -> CheckoutResponse:
     """POST chatgpt.com/backend-api/payments/checkout with hosted mode payload."""
+    billing = REGION_BILLING.get(region, REGION_BILLING[DEFAULT_REGION])
+
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json",
@@ -136,8 +148,8 @@ async def _call_chatgpt_checkout(
         "entry_point": "all_plans_pricing_modal",
         "plan_name": "chatgptplusplan",
         "billing_details": {
-            "country": "VN",
-            "currency": "VND",
+            "country": billing["country"],
+            "currency": billing["currency"],
         },
         "promo_campaign": {
             "promo_campaign_id": "plus-1-month-free",
@@ -256,6 +268,7 @@ async def _call_stripe_init(
 async def get_checkout_url(
     access_token: str,
     *,
+    region: str = DEFAULT_REGION,
     proxy: str | None = None,
     timeout: float = 30.0,
 ) -> str:
@@ -268,6 +281,7 @@ async def get_checkout_url(
 
     Args:
         access_token: Bearer JWT from ChatGPT session.
+        region: Region code (VN, ID, IN, US). Determines country + currency.
         proxy: HTTP/HTTPS proxy URL (optional).
         timeout: Per-request timeout in seconds (default 30s).
 
@@ -284,7 +298,9 @@ async def get_checkout_url(
 
     async with AsyncSession(impersonate=_IMPERSONATE, proxies=proxies) as session:
         # Step 1: call checkout API
-        checkout = await _call_chatgpt_checkout(session, access_token, timeout=timeout)
+        checkout = await _call_chatgpt_checkout(
+            session, access_token, region=region, timeout=timeout,
+        )
 
         # Step 2: check if hosted URL is already available
         if checkout.url:

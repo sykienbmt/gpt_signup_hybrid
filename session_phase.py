@@ -1,4 +1,4 @@
-"""Get Session: Login ChatGPT bằng browser (Camoufox) + password + 2FA → trả full session JSON.
+"""Get Session: Login ChatGPT bằng browser + password + 2FA → trả full session JSON.
 
 Dùng browser thật vì auth.openai.com có Cloudflare JS challenge —
 curl_cffi không bypass được.
@@ -14,15 +14,18 @@ Flow:
 from __future__ import annotations
 
 import asyncio
-import json
 import shutil
 import time
 import uuid
-from datetime import datetime
-from pathlib import Path
 from typing import Any, Callable
 
-from .config import Settings, ensure_runtime_dirs, load_settings, prepare_profile_dir
+from ._browser_retry import (
+    LAUNCH_RETRY_BACKOFF as _LAUNCH_RETRY_BACKOFF,
+    LAUNCH_RETRY_MAX as _LAUNCH_RETRY_MAX,
+    is_driver_dead_error as _is_driver_dead_error,
+)
+from ._nextauth_bootstrap import bootstrap_authorize_url
+from .config import ensure_runtime_dirs, load_settings, prepare_profile_dir
 from .totp_helper import generate_code
 
 
@@ -32,36 +35,6 @@ LogFn = Callable[[str], None]
 class SessionError(Exception):
     """Login/session fetch failed."""
 
-
-# JS: bootstrap NextAuth → return authorize URL
-_BOOTSTRAP_JS = r"""
-async ({deviceId}) => {
-    const csrfRes = await fetch('/api/auth/csrf', {credentials: 'include'});
-    if (!csrfRes.ok) throw new Error('csrf HTTP ' + csrfRes.status);
-    const csrfData = await csrfRes.json();
-    const csrfToken = csrfData.csrfToken;
-
-    const params = new URLSearchParams({
-        'prompt': 'login',
-        'ext-oai-did': deviceId,
-    }).toString();
-    const body = new URLSearchParams({
-        callbackUrl: '/',
-        csrfToken,
-        json: 'true',
-    }).toString();
-    const signRes = await fetch('/api/auth/signin/openai?' + params, {
-        method: 'POST',
-        credentials: 'include',
-        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-        body,
-    });
-    if (!signRes.ok) throw new Error('signin HTTP ' + signRes.status);
-    const signData = await signRes.json();
-    if (!signData.url) throw new Error('no url');
-    return signData.url;
-}
-"""
 
 # JS: fetch /api/auth/session trong page context chatgpt.com
 _FETCH_SESSION_JS = r"""
@@ -80,62 +53,63 @@ async def _get_session_browser(
     secret: str | None = None,
     headless: bool = True,
     proxy: str | None = None,
+    tls_insecure: bool = False,
     log: LogFn = print,
 ) -> dict[str, Any]:
-    """Login ChatGPT bằng Camoufox headless → return session JSON."""
+    """Login ChatGPT bằng browser thật → return session JSON.
+
+    Retry: nếu driver pipe đóng sớm TRƯỚC khi submit password → relaunch.
+    Sau khi đã submit password thì fail-fast để tránh nhiều lần thử login
+    (rủi ro lockout / captcha challenge).
+    """
+    if tls_insecure:
+        from .config import warn_insecure_tls
+        warn_insecure_tls("session_phase")
+        log("[security] TLS verification DISABLED — debug mode")
+
     settings = load_settings()
     job_id = f"session_{uuid.uuid4().hex[:10]}"
-    profile_dir = settings.profiles_dir / f"camoufox_{job_id}"
-    ensure_runtime_dirs(settings, extra=(profile_dir,))
-    prepare_profile_dir(
-        profile_dir=profile_dir,
-        template_dir=settings.browser_camoufox_profile_dir,
-        use_template=True,
+    preferred_engine = (
+        "camoufox"
+        if (settings.browser_engine or "camoufox").lower() == "camoufox"
+        else "chromium"
     )
-
+    engine_order = [preferred_engine]
+    if preferred_engine == "camoufox":
+        engine_order.append("chromium")
     w, h = settings.browser_viewport_width, settings.browser_viewport_height
-
-    from camoufox.async_api import AsyncCamoufox
-    from camoufox.utils import Screen as _Screen
-
-    chrome_h = 85
-    extra_config: dict = {}
-    extra_config["window.innerWidth"] = w
-    extra_config["window.innerHeight"] = h
-    extra_config["window.outerWidth"] = w
-    extra_config["window.outerHeight"] = h + chrome_h
-    extra_config["screen.width"] = w
-    extra_config["screen.height"] = h + chrome_h
-    extra_config["screen.availWidth"] = w
-    extra_config["screen.availHeight"] = h + chrome_h
-    fixed_screen = _Screen(min_width=w, max_width=w, min_height=h + chrome_h, max_height=h + chrome_h)
-
+    viewport = {"width": w, "height": h}
     proxy_kwargs: dict[str, Any] = {}
     if proxy:
         proxy_kwargs["proxy"] = {"server": proxy}
 
-    cf = AsyncCamoufox(
-        headless=headless,
-        persistent_context=True,
-        user_data_dir=str(profile_dir),
-        viewport={"width": w, "height": h},
-        screen=fixed_screen,
-        ignore_https_errors=True,
-        config=extra_config,
-        **proxy_kwargs,
-    )
-    ctx = await cf.__aenter__()
-    try:
-        page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+    progress = {"password_submitted": False}
+
+    def _profile_bundle(engine: str) -> tuple[Any, Any]:
+        if engine == "camoufox":
+            return (
+                settings.profiles_dir / f"camoufox_{job_id}",
+                settings.browser_camoufox_profile_dir,
+            )
+        return (
+            settings.profile_dir_for(job_id),
+            settings.browser_profile_template_dir,
+        )
+
+    async def _drive_session_flow(ctx: Any, page: Any) -> dict[str, Any]:
+        device_id = str(uuid.uuid4())
+        logging_id = str(uuid.uuid4())
 
         # Step 1: bootstrap
         log("[session] loading chatgpt.com...")
         await page.goto("https://chatgpt.com/", wait_until="domcontentloaded")
-        device_id = str(uuid.uuid4())
         log("[session] bootstrapping NextAuth...")
-        authorize_url = await page.evaluate(_BOOTSTRAP_JS, {"deviceId": device_id})
-        if not authorize_url or "auth.openai.com" not in authorize_url:
-            raise SessionError(f"bootstrap failed: {authorize_url}")
+        authorize_url = await bootstrap_authorize_url(
+            page,
+            email=email,
+            device_id=device_id,
+            logging_id=logging_id,
+        )
         log("[session] authorize URL ready")
 
         # Step 2: navigate authorize → login page
@@ -146,9 +120,12 @@ async def _get_session_browser(
         # Có thể ở /log-in (email step) → cần fill email trước
         # Hoặc ở /log-in/password → fill password luôn
         if "/log-in/password" not in page.url:
-            # Check nếu cần nhập email trước
             email_input = None
-            for sel in ('input[name="email"]', 'input[type="email"]', 'input[inputmode="email"]'):
+            for sel in (
+                'input[name="email"]',
+                'input[type="email"]',
+                'input[inputmode="email"]',
+            ):
                 try:
                     loc = page.locator(sel).first
                     if await loc.is_visible(timeout=8000):
@@ -163,8 +140,10 @@ async def _get_session_browser(
                 await email_input.fill("")
                 await email_input.type(email, delay=30)
                 await asyncio.sleep(0.3)
-                # Submit email
-                for btn_sel in ('button[type="submit"]', 'button:has-text("Continue")'):
+                for btn_sel in (
+                    'button[type="submit"]',
+                    'button:has-text("Continue")',
+                ):
                     try:
                         await page.click(btn_sel, timeout=3000)
                         log(f"[session] submitted email ({btn_sel})")
@@ -194,14 +173,19 @@ async def _get_session_browser(
         await pwd_input.type(password, delay=40)
         await asyncio.sleep(0.3)
 
-        # Submit password
-        for btn_sel in ('button[type="submit"]', 'button:has-text("Continue")', 'button:has-text("Log in")'):
+        # Submit password — sau đây không retry để tránh login spam
+        for btn_sel in (
+            'button[type="submit"]',
+            'button:has-text("Continue")',
+            'button:has-text("Log in")',
+        ):
             try:
                 await page.click(btn_sel, timeout=3000)
                 log(f"[session] clicked {btn_sel}")
                 break
             except Exception:
                 continue
+        progress["password_submitted"] = True
 
         await asyncio.sleep(3.0)
         log(f"[session] after password: {page.url.split('?')[0]}")
@@ -214,9 +198,13 @@ async def _get_session_browser(
             log("[session] MFA page detected, generating TOTP...")
             code = generate_code(secret)
 
-            # Find OTP input
             otp_input = None
-            for sel in ('input[name="code"]', 'input[inputmode="numeric"]', 'input[autocomplete="one-time-code"]', 'input[maxlength="6"]'):
+            for sel in (
+                'input[name="code"]',
+                'input[inputmode="numeric"]',
+                'input[autocomplete="one-time-code"]',
+                'input[maxlength="6"]',
+            ):
                 try:
                     loc = page.locator(sel).first
                     if await loc.is_visible(timeout=5000):
@@ -234,8 +222,11 @@ async def _get_session_browser(
             log(f"[session] TOTP code: {code}")
             await asyncio.sleep(0.5)
 
-            # Submit MFA
-            for btn_sel in ('button[type="submit"]', 'button:has-text("Continue")', 'button:has-text("Verify")'):
+            for btn_sel in (
+                'button[type="submit"]',
+                'button:has-text("Continue")',
+                'button:has-text("Verify")',
+            ):
                 try:
                     await page.click(btn_sel, timeout=3000)
                     log(f"[session] clicked {btn_sel}")
@@ -248,6 +239,7 @@ async def _get_session_browser(
 
         # Step 5: đợi redirect về chatgpt.com + session cookies
         deadline = time.monotonic() + 30.0
+        session_ready = False
         while time.monotonic() < deadline:
             cookies = await ctx.cookies("https://chatgpt.com/")
             names = {c["name"] for c in cookies}
@@ -257,13 +249,13 @@ async def _get_session_browser(
             )
             if has_session:
                 log("[session] session cookies ready")
+                session_ready = True
                 break
-            # Check if still on auth page
             if "chatgpt.com" in page.url and "auth.openai.com" not in page.url:
                 await asyncio.sleep(1.0)
                 continue
             await asyncio.sleep(1.0)
-        else:
+        if not session_ready:
             raise SessionError(f"timeout waiting session cookies. URL: {page.url}")
 
         # Đảm bảo đang ở chatgpt.com
@@ -275,17 +267,148 @@ async def _get_session_browser(
         log("[session] fetching /api/auth/session...")
         session_data = await page.evaluate(_FETCH_SESSION_JS)
         if not isinstance(session_data, dict) or not session_data.get("accessToken"):
-            raise SessionError(f"session response invalid: {str(session_data)[:200]}")
+            raise SessionError(
+                f"session response invalid: {str(session_data)[:200]}"
+            )
 
-        log(f"[session] ✓ done — user: {session_data.get('user', {}).get('email', '?')}")
+        log(
+            f"[session] ✓ done — user: "
+            f"{session_data.get('user', {}).get('email', '?')}"
+        )
         return session_data
 
-    finally:
+    async def _run_camoufox_once(profile_dir: Any) -> dict[str, Any]:
+        from camoufox.async_api import AsyncCamoufox
+        from camoufox.utils import Screen as _Screen
+
+        chrome_h = 85
+        extra_config: dict = {}
+        extra_config["window.innerWidth"] = w
+        extra_config["window.innerHeight"] = h
+        extra_config["window.outerWidth"] = w
+        extra_config["window.outerHeight"] = h + chrome_h
+        extra_config["screen.width"] = w
+        extra_config["screen.height"] = h + chrome_h
+        extra_config["screen.availWidth"] = w
+        extra_config["screen.availHeight"] = h + chrome_h
+        fixed_screen = _Screen(
+            min_width=w, max_width=w, min_height=h + chrome_h, max_height=h + chrome_h,
+        )
+        cf = AsyncCamoufox(
+            headless=headless,
+            persistent_context=True,
+            user_data_dir=str(profile_dir),
+            viewport=viewport,
+            screen=fixed_screen,
+            ignore_https_errors=tls_insecure,
+            config=extra_config,
+            **proxy_kwargs,
+        )
+        ctx = await cf.__aenter__()
         try:
-            await cf.__aexit__(None, None, None)
-        except Exception:
-            pass
-        shutil.rmtree(profile_dir, ignore_errors=True)
+            page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+            return await _drive_session_flow(ctx, page)
+        finally:
+            try:
+                await cf.__aexit__(None, None, None)
+            except Exception:
+                pass
+
+    async def _run_chromium_once(profile_dir: Any) -> dict[str, Any]:
+        from playwright.async_api import async_playwright
+
+        playwright = await async_playwright().start()
+        try:
+            channel = settings.browser_channel or None
+            ctx = await playwright.chromium.launch_persistent_context(
+                user_data_dir=str(profile_dir),
+                headless=headless,
+                channel=channel,
+                viewport=viewport,
+                ignore_https_errors=tls_insecure,
+                **proxy_kwargs,
+            )
+            try:
+                page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+                return await _drive_session_flow(ctx, page)
+            finally:
+                try:
+                    await ctx.close()
+                except Exception:
+                    pass
+        finally:
+            await playwright.stop()
+
+    runners = {
+        "camoufox": _run_camoufox_once,
+        "chromium": _run_chromium_once,
+    }
+    last_exc: BaseException | None = None
+    try:
+        for engine_index, engine in enumerate(engine_order):
+            profile_dir, template_dir = _profile_bundle(engine)
+            ensure_runtime_dirs(settings, extra=(profile_dir,))
+            prepare_profile_dir(
+                profile_dir=profile_dir,
+                template_dir=template_dir,
+                use_template=settings.browser_use_profile_template,
+            )
+            if engine_index > 0:
+                log(f"[session] fallback browser engine: {engine}")
+
+            for attempt in range(1, _LAUNCH_RETRY_MAX + 1):
+                progress["password_submitted"] = False
+                try:
+                    return await runners[engine](profile_dir)
+                except SessionError:
+                    raise
+                except Exception as exc:
+                    last_exc = exc
+                    if not _is_driver_dead_error(exc):
+                        raise SessionError(
+                            f"browser launch/driver error: {type(exc).__name__}: {exc}"
+                        ) from exc
+                    if progress["password_submitted"]:
+                        log(
+                            f"[session] driver pipe đóng sau khi đã submit password — "
+                            f"không retry để tránh login spam: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                        raise SessionError(
+                            f"driver pipe chết sau submit password (không retry): {exc}"
+                        ) from exc
+                    log(
+                        f"[session] driver pipe đóng sớm "
+                        f"(attempt {attempt}/{_LAUNCH_RETRY_MAX}): "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    if attempt >= _LAUNCH_RETRY_MAX:
+                        break
+                    shutil.rmtree(profile_dir, ignore_errors=True)
+                    prepare_profile_dir(
+                        profile_dir=profile_dir,
+                        template_dir=template_dir,
+                        use_template=settings.browser_use_profile_template,
+                    )
+                    await asyncio.sleep(_LAUNCH_RETRY_BACKOFF)
+
+            if engine == "camoufox" and engine_index + 1 < len(engine_order):
+                log(
+                    "[session] camoufox chết sớm ở auth redirect — "
+                    "thử fallback sang chromium"
+                )
+                continue
+
+            if last_exc is not None and _is_driver_dead_error(last_exc):
+                raise SessionError(
+                    f"driver pipe đóng sau {_LAUNCH_RETRY_MAX} lần thử: {last_exc}"
+                ) from last_exc
+
+        raise SessionError("browser launch failed without specific error")
+    finally:
+        for engine in engine_order:
+            profile_dir, _ = _profile_bundle(engine)
+            shutil.rmtree(profile_dir, ignore_errors=True)
 
 
 async def get_session(
@@ -295,6 +418,7 @@ async def get_session(
     secret: str | None = None,
     headless: bool = True,
     proxy: str | None = None,
+    tls_insecure: bool = False,
     log: LogFn = print,
 ) -> dict[str, Any]:
     """Async: login ChatGPT → return full /api/auth/session JSON."""
@@ -304,6 +428,7 @@ async def get_session(
         secret=secret,
         headless=headless,
         proxy=proxy,
+        tls_insecure=tls_insecure,
         log=log,
     )
 
@@ -315,6 +440,7 @@ def get_session_sync(
     secret: str | None = None,
     headless: bool = True,
     proxy: str | None = None,
+    tls_insecure: bool = False,
     log: LogFn = print,
 ) -> dict[str, Any]:
     """Sync wrapper."""
@@ -324,6 +450,7 @@ def get_session_sync(
         secret=secret,
         headless=headless,
         proxy=proxy,
+        tls_insecure=tls_insecure,
         log=log,
     ))
 
