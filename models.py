@@ -28,6 +28,13 @@ class SignupRequest(BaseModel):
     )
     off_font: bool = Field(default=False, description="Tắt camoufox font randomization.")
     profile_template: bool = Field(default=True, description="Clone profile template (cookies, addons).")
+    tls_insecure: bool = Field(
+        default=False,
+        description=(
+            "Bỏ TLS cert verification cho browser context (chỉ dùng debug/MITM proxy). "
+            "Production phải để False — bật qua env GPT_SIGNUP_INSECURE_TLS=1 hoặc CLI flag."
+        ),
+    )
 
     # Polling OTP — chọn 1 trong 3 provider:
     #   - Worker logs API (icloud-cf-mail style) — default cho mail @icloud.com qua relay.
@@ -52,7 +59,13 @@ class SignupRequest(BaseModel):
         default="12345678@",
         description="Bearer token cho Authorization header. Để rỗng nếu Worker không yêu cầu.",
     )
-    email_insecure_tls: bool = Field(default=True, description="Bỏ verify TLS (dùng khi host có _).")
+    email_insecure_tls: bool = Field(
+        default=False,
+        description=(
+            "Bỏ verify TLS khi poll OTP từ Worker (chỉ dùng debug/local dev). "
+            "Production phải để False — bật chỉ qua flag/env opt-in."
+        ),
+    )
     # Outlook combo config
     outlook_combo: str | None = Field(
         default=None,

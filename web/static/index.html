@@ -214,10 +214,21 @@
     <span class="muted card-head-note" id="link-mode-hint">One line per combo: email|password|2fa_secret</span>
     <textarea class="combo-textarea" id="link-combo-input" placeholder="email@hotmail.com|password123|DNPARKKMM5EYOPDG...&#10;email2@outlook.com|pass456|I77PEBZQNEBE67SU..." maxlength="50000"></textarea>
     <div class="card-settings">
-      <label class="input-group settings-field-compact">
-        <span class="input-label">Timeout (s/job)</span>
-        <input type="number" id="link-job-timeout" value="180" min="30" max="600" step="10" />
-      </label>
+      <div class="card-settings-row card-settings-row-mixed">
+        <label class="input-group config-field-short">
+          <span class="input-label">Region</span>
+          <select id="link-region-select">
+            <option value="VN">🇻🇳 Vietnam (VND)</option>
+            <option value="ID">🇮🇩 Indonesia (IDR)</option>
+            <option value="IN">🇮🇳 India (INR)</option>
+            <option value="US">🇺🇸 US (USD)</option>
+          </select>
+        </label>
+        <label class="input-group settings-field-compact">
+          <span class="input-label">Timeout (s/job)</span>
+          <input type="number" id="link-job-timeout" value="180" min="30" max="600" step="10" />
+        </label>
+      </div>
     </div>
     <div class="card-actions">
       <button id="link-btn-run" class="btn btn-primary">Get Link</button>

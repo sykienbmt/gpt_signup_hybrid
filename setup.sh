@@ -1,12 +1,22 @@
 #!/usr/bin/env bash
-# gpt_signup_hybrid — 1 lệnh setup + start web UI
+# gpt_signup_hybrid — 1 lệnh setup + start web UI.
+#
 # Coi thư mục này là project root: tất cả file (.venv, runtime, .env)
 # đều nằm trong gpt_signup_hybrid/, không leak ra parent.
+#
+# Pinned stack (xem requirements.txt):
+#   - Python 3.13 (Camoufox 0.4.11 + Firefox 135 chưa hỗ trợ Python 3.14)
+#   - playwright==1.49.1 (Firefox 132 driver — match Camoufox FF135)
+#   - camoufox==0.4.11 (binary FF 135.0.1-beta.24)
+#
+# Lý do: playwright 1.60 + Camoufox FF135 gây lỗi
+#   "Connection closed while reading from the driver" khi page.goto sang
+#   auth.openai.com (CDP protocol mismatch).
 #
 # Usage:
 #   cd gpt_signup_hybrid
 #   bash setup.sh
-set -e
+set -euo pipefail
 
 # ROOT_DIR = chính thư mục chứa setup.sh
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -16,52 +26,75 @@ cd "$ROOT_DIR"
 # khi user chạy `.venv/bin/python -m gpt_signup_hybrid` từ trong package.
 PARENT_DIR="$(dirname "$ROOT_DIR")"
 
+# Python 3.13 bắt buộc — fail-fast nếu không có.
+PY_BIN="${PYTHON:-}"
+if [ -z "${PY_BIN}" ]; then
+  if command -v python3.13 >/dev/null 2>&1; then
+    PY_BIN="$(command -v python3.13)"
+  else
+    echo "ERROR: cần Python 3.13 (Camoufox 0.4.11 chưa hỗ trợ 3.14)." >&2
+    echo "  Cài qua Homebrew:  brew install python@3.13" >&2
+    echo "  Hoặc set PYTHON=/path/to/python3.13 rồi chạy lại." >&2
+    exit 1
+  fi
+fi
+PY_VERSION="$("$PY_BIN" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+if [ "$PY_VERSION" != "3.13" ]; then
+  echo "ERROR: $PY_BIN báo Python $PY_VERSION, cần 3.13." >&2
+  exit 1
+fi
+
+REQ_FILE="$ROOT_DIR/requirements.txt"
+if [ ! -f "$REQ_FILE" ]; then
+  echo "ERROR: $REQ_FILE không tồn tại." >&2
+  exit 1
+fi
+
 echo "═══════════════════════════════════════════════════════════"
 echo "  gpt_signup_hybrid — auto setup + start"
+echo "  python: $PY_BIN ($PY_VERSION)"
 echo "  root:   $ROOT_DIR"
 echo "  parent: $PARENT_DIR (for python -m import)"
 echo "═══════════════════════════════════════════════════════════"
 
 # 1. Python venv (trong chính package)
 if [ ! -d ".venv" ]; then
-  echo "[1/6] Creating .venv in $ROOT_DIR..."
-  python3 -m venv .venv
+  echo "[1/6] Creating .venv (python $PY_VERSION)..."
+  "$PY_BIN" -m venv .venv
 else
-  echo "[1/6] .venv exists ✓"
+  EXISTING="$(.venv/bin/python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "?")"
+  if [ "$EXISTING" != "3.13" ]; then
+    echo "[1/6] .venv đang dùng Python $EXISTING — recreate cho 3.13..."
+    rm -rf .venv
+    "$PY_BIN" -m venv .venv
+  else
+    echo "[1/6] .venv exists (python 3.13) ✓"
+  fi
 fi
 
-# 2. Install deps
-echo "[2/6] Installing dependencies..."
-.venv/bin/pip install -q --upgrade pip 2>/dev/null
-.venv/bin/pip install -q \
-  pydantic \
-  typer \
-  httpx \
-  "curl_cffi>=0.7" \
-  pyotp \
-  fastapi \
-  uvicorn \
-  camoufox \
-  playwright \
-  2>/dev/null
+# 2. Install pinned deps
+echo "[2/6] Installing dependencies (pinned)..."
+.venv/bin/pip install -q --upgrade pip
+.venv/bin/pip install -q -r "$REQ_FILE"
 
 # 3. Inject .pth file để Python tìm thấy package khi CWD = chính nó
-SITE_PKG="$(.venv/bin/python -c "import site, sys; print(site.getsitepackages()[0])" 2>/dev/null)"
+SITE_PKG="$(.venv/bin/python -c 'import site; print(site.getsitepackages()[0])')"
 if [ -n "$SITE_PKG" ] && [ -d "$SITE_PKG" ]; then
   echo "[3/6] Registering parent dir in venv site-packages..."
   echo "$PARENT_DIR" > "$SITE_PKG/_gpt_signup_hybrid_root.pth"
   echo "  ✓ $SITE_PKG/_gpt_signup_hybrid_root.pth → $PARENT_DIR"
 else
-  echo "[3/6] WARN: không xác định được site-packages, skip .pth injection."
+  echo "ERROR: không xác định được site-packages." >&2
+  exit 1
 fi
 
-# 4. Playwright Firefox (for Camoufox)
-echo "[4/6] Installing Playwright Firefox..."
-.venv/bin/playwright install firefox 2>/dev/null || true
+# 4. Playwright Firefox (driver browser) — chỉ install nếu chưa có.
+echo "[4/6] Installing Playwright Firefox (driver)..."
+.venv/bin/playwright install firefox
 
-# 5. Camoufox binary
+# 5. Camoufox binary (Firefox stealth build) — fetch idempotent.
 echo "[5/6] Fetching Camoufox binary..."
-.venv/bin/python -m camoufox fetch 2>/dev/null || true
+.venv/bin/python -m camoufox fetch
 
 # 6. .env trong chính package
 if [ ! -f ".env" ]; then

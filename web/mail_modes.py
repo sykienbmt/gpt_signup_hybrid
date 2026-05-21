@@ -63,6 +63,7 @@ def _build_outlook_request(
     keep_browser_open: bool = False,
     proxy: str | None = None,
 ) -> SignupRequest:
+    from ..config import env_insecure_tls
     return SignupRequest(
         email=parsed.email,
         mail_provider="outlook",
@@ -71,6 +72,7 @@ def _build_outlook_request(
         keep_browser_open=keep_browser_open,
         password=password,
         proxy=proxy,
+        tls_insecure=env_insecure_tls(),
     )
 
 
@@ -108,18 +110,25 @@ def _build_worker_request(
     proxy: str | None = None,
 ) -> SignupRequest:
     cfg = worker_config or {}
+    # insecure_tls chỉ bật qua opt-in: env GPT_SIGNUP_INSECURE_TLS=1 hoặc
+    # worker_config["insecure_tls"]. Default = secure.
+    from ..config import env_insecure_tls
+    raw_flag = str(cfg.get("insecure_tls", "")).strip().lower()
+    cfg_insecure = raw_flag in ("1", "true", "yes", "on")
+    insecure = env_insecure_tls() or cfg_insecure
     return SignupRequest(
         email=parsed.email,
         mail_provider="worker",
         email_logs_url=cfg.get("logs_url", "https://icloud-cf-mail.n5pskgzs9g.workers.dev/logs"),
         email_api_key=cfg.get("api_key", ""),
-        email_insecure_tls=True,
+        email_insecure_tls=insecure,
         otp_timeout_seconds=200.0,
         otp_poll_interval_seconds=15.0,
         headless=headless,
         keep_browser_open=keep_browser_open,
         password=password,
         proxy=proxy,
+        tls_insecure=insecure,
     )
 
 
@@ -185,6 +194,7 @@ def _build_gmail_advanced_request(
 
     # Nếu email rỗng → dùng placeholder, pre_check sẽ resolve
     signup_email = email if email else "pending@gmail-advanced.local"
+    from ..config import env_insecure_tls
     return SignupRequest(
         email=signup_email,
         mail_provider="gmail_advanced",
@@ -195,6 +205,7 @@ def _build_gmail_advanced_request(
         keep_browser_open=keep_browser_open,
         password=password,
         proxy=proxy,
+        tls_insecure=env_insecure_tls(),
     )
 
 

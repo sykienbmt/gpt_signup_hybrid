@@ -43,9 +43,10 @@
   }
 
   function api(path, opts = {}) {
+    const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) };
     return fetch(path, {
-      headers: { 'Content-Type': 'application/json' },
       ...opts,
+      headers,
     }).then((r) => {
       if (!r.ok) return r.text().then((t) => { throw new Error(`HTTP ${r.status}: ${t}`); });
       return r.json();
@@ -71,7 +72,7 @@
     }
 
     const stats = { queued: 0, running: 0, success: 0, error: 0, cancelled: 0 };
-    const html = state.order.map((id) => {
+    const html = state.order.map((id, idx) => {
       const j = state.jobs.get(id);
       if (!j) return '';
       stats[j.status] = (stats[j.status] || 0) + 1;
@@ -92,6 +93,7 @@
 
       return `
         <div class="${cls}" data-id="${escHtml(id)}">
+          <div class="job-index">${idx + 1}</div>
           <div class="job-status status-${escHtml(j.status)}">${escHtml(j.status)}</div>
           <div class="job-main">
             <div class="job-email" title="${escHtml(j.email)}">${escHtml(j.email)}</div>
@@ -284,6 +286,10 @@
     state.order = jobs.map((j) => j.id);
     state.jobs.clear();
     for (const j of jobs) state.jobs.set(j.id, j);
+    // Prune sessionCache: chỉ giữ entry cho jobs còn trong snapshot
+    for (const cachedId of Array.from(sessionCache.keys())) {
+      if (!state.jobs.has(cachedId)) sessionCache.delete(cachedId);
+    }
     renderJobs();
     renderOutputs();
   }
@@ -299,6 +305,7 @@
   function applyRemove(jobId) {
     state.jobs.delete(jobId);
     state.order = state.order.filter((id) => id !== jobId);
+    sessionCache.delete(jobId);
     if (state.activeJobId === jobId) { state.activeJobId = null; renderLog(null); }
     renderJobs();
     renderOutputs();
@@ -315,7 +322,7 @@
   }
 
   function connectSSE() {
-    const es = new EventSource('/api/session/events');
+    const es = window.GptUi.authEventSource('/api/session/events');
     es.onmessage = (e) => {
       try {
         const data = JSON.parse(e.data);

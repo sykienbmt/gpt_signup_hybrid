@@ -52,6 +52,19 @@ _DEFAULT_JOB_TIMEOUT = min(max(float(_env("HYBRID_JOB_TIMEOUT", "240")), 30), 60
 _DEFAULT_PROXY = _env("HYBRID_OUTLOOK_PROXY", "") or None
 
 
+def _mask_proxy(proxy: str | None) -> str:
+    """Mask user:pass trong proxy URL cho log. None/empty → 'direct'."""
+    if not proxy:
+        return "direct"
+    if "@" in proxy:
+        scheme_split = proxy.split("://", 1)
+        if len(scheme_split) == 2:
+            scheme, rest = scheme_split
+            _, _, host = rest.partition("@")
+            return f"{scheme}://***@{host}"
+    return proxy
+
+
 JobStatus = str  # queued | running | success | error | cancelled
 
 
@@ -84,11 +97,11 @@ class Job:
             "mail_mode": self.mail_mode,
             "status": self.status,
             "error": self.error,
-            "password": self.password,
-            "secret": self.secret,
-            "first_code": self.first_code,
             "user_id": self.user_id,
-            "session_path": self.session_path,
+            "has_password": bool(self.password),
+            "has_secret": bool(self.secret),
+            "has_first_code": bool(self.first_code),
+            "has_session_path": bool(self.session_path),
             "has_session": self.session_data is not None,
             "payment_link": self.payment_link,
             "created_at": self.created_at,
@@ -100,8 +113,19 @@ class Job:
             "log_count": len(self.log_lines),
         }
 
+    def to_dict_secrets(self) -> dict[str, Any]:
+        """Chỉ password + secret + first_code + session_path. Dùng cho /api/jobs/secrets."""
+        return {
+            "password": self.password,
+            "secret": self.secret,
+            "first_code": self.first_code,
+            "session_path": self.session_path,
+        }
+
     def to_dict_full(self) -> dict[str, Any]:
+        """Detail endpoint — bao gồm cả secrets + session_data + log_lines."""
         d = self.to_dict()
+        d.update(self.to_dict_secrets())
         d["log_lines"] = list(self.log_lines)
         d["session_data"] = self.session_data
         return d
@@ -142,6 +166,10 @@ class JobManager:
         """Đảm bảo đủ worker theo max_concurrent. Gọi mỗi khi thêm job hoặc đổi config."""
         if not self._worker_started:
             self._worker_started = True
+        # Prune worker đã chết (bị cancel khi stop_all hoặc exit do exception).
+        # Nếu không prune, len(self._workers) vẫn = _max → không spawn worker mới
+        # → job enqueue sau stop_all sẽ nằm yên trong queue mãi.
+        self._workers = [w for w in self._workers if not w.done()]
         # Scale lên nếu cần thêm worker
         while len(self._workers) < self._max:
             w = asyncio.create_task(self._worker_loop())
@@ -156,6 +184,10 @@ class JobManager:
 
         Stagger: trước mỗi start, đợi tới ít nhất `_stagger_min_seconds` sau lần
         start gần nhất + random jitter — tránh spawn nhiều browser cùng tick.
+
+        Job execution wrap trong inner task để `stop_all` cancel job mà không
+        kill luôn worker. Nếu worker bị kill, các job add lại sau đó sẽ kẹt
+        trong queue vì không ai pick lên.
         """
         try:
             while True:
@@ -163,7 +195,10 @@ class JobManager:
                 job = self.jobs.get(job_id)
                 if job is None or job.status != "queued":
                     continue  # job đã bị remove/cancel trước khi tới lượt
-                # Stagger start nếu max_concurrent > 1 (single mode không cần)
+                # Stagger start nếu max_concurrent > 1 (single mode không cần).
+                # Reserve slot trong lock (fast), sleep ngoài lock + poll job
+                # status mỗi 0.25s — bail nhanh nếu job bị cancel/remove giữa
+                # chừng (đảm bảo stop_all + add lại không kẹt vì stagger debt).
                 if self._max > 1:
                     async with self._stagger_lock:
                         now = time.monotonic()
@@ -173,10 +208,36 @@ class JobManager:
                                 self._stagger_min_seconds, self._stagger_max_seconds,
                             )
                             wait = max(wait_min, jitter)
-                            self._job_log(job, f"[stagger] đợi {wait:.1f}s trước khi start")
-                            await asyncio.sleep(wait)
-                        self._last_start_ts = time.monotonic()
-                await self._run_job_with_timeout(job)
+                            self._last_start_ts = now + wait
+                        else:
+                            wait = 0.0
+                            self._last_start_ts = now
+                    if wait > 0:
+                        self._job_log(job, f"[stagger] đợi {wait:.1f}s trước khi start")
+                        deadline = time.monotonic() + wait
+                        while True:
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                break
+                            await asyncio.sleep(min(0.25, remaining))
+                            cur = self.jobs.get(job_id)
+                            if cur is None or cur.status != "queued":
+                                break
+                    cur = self.jobs.get(job_id)
+                    if cur is None or cur.status != "queued":
+                        continue
+                inner = asyncio.create_task(self._run_job_with_timeout(job))
+                self._tasks[job_id] = inner
+                try:
+                    await inner
+                except asyncio.CancelledError:
+                    # Inner job bị cancel (stop_all/remove_job) — worker đi tiếp.
+                    # Nếu chính worker bị cancel → re-raise.
+                    if inner.cancelled():
+                        continue
+                    raise
+                finally:
+                    self._tasks.pop(job_id, None)
         except asyncio.CancelledError:
             pass
 
@@ -267,17 +328,7 @@ class JobManager:
         self._broadcast({"type": "job", "job": job.to_dict()})
 
     def _safe_proxy_log(self) -> str:
-        """Trả URL proxy đã ẩn user:pass cho log."""
-        p = self._proxy
-        if not p:
-            return "direct"
-        if "@" in p:
-            scheme_split = p.split("://", 1)
-            if len(scheme_split) == 2:
-                scheme, rest = scheme_split
-                _, _, host = rest.partition("@")
-                return f"{scheme}://***@{host}"
-        return p
+        return _mask_proxy(self._proxy)
 
     def add_jobs(self, combos: list[str], *, default_password: str | None = None, mail_mode: str = "outlook", worker_config: dict[str, str] | None = None) -> list[Job]:
         """Thêm jobs từ list combo/email strings. Skip đã có trong list (dedup theo email)."""
@@ -362,14 +413,17 @@ class JobManager:
                 job.finished_at = time.time()
                 self._broadcast_job(job)
                 count += 1
+        # Reset stagger debt — batch jobs mới sau stop_all không phải đợi
+        # khoảng cách stagger tính từ batch cũ.
+        self._last_start_ts = 0.0
         return count
 
     def clear_finished(self) -> int:
-        """Xoá tất cả jobs đã xong (success/error/cancelled) khỏi memory. Giữ running/queued."""
+        """Xoá tất cả jobs đã xong (success/error) khỏi memory. Giữ running/queued/cancelled."""
         removed = 0
         for jid in list(self.order):
             job = self.jobs.get(jid)
-            if job and job.status in ("success", "error", "cancelled"):
+            if job and job.status in ("success", "error"):
                 self.jobs.pop(jid, None)
                 self.order.remove(jid)
                 self._tasks.pop(jid, None)
@@ -422,6 +476,18 @@ class JobManager:
     def get_log(self, job_id: str) -> list[str]:
         job = self.jobs.get(job_id)
         return list(job.log_lines) if job else []
+
+    def get_secrets_map(self) -> dict[str, dict[str, Any]]:
+        """Trả map job_id → {password, secret, first_code, session_path} cho mọi job.
+
+        Dùng cho UI render Success pane một lần thay vì fetch detail từng job.
+        Endpoint gọi method này phải có auth gate.
+        """
+        return {
+            jid: self.jobs[jid].to_dict_secrets()
+            for jid in self.order
+            if jid in self.jobs
+        }
 
     def _spawn(self, job: Job) -> None:
         """Legacy: chỉ dùng cho internal retry trực tiếp (không qua queue)."""
@@ -507,6 +573,7 @@ class JobManager:
                 mfa_result = await enable_2fa(
                     access_token=access_token,
                     cookies=sdata.get("cookies"),
+                    proxy=self._proxy,
                     log=log,
                 )
             except MfaError as exc:
@@ -583,11 +650,6 @@ class JobManager:
                 job.finished_at = time.time()
                 self._broadcast_job(job)
                 return
-                job.status = "error"
-                job.error = result.error or "signup failed"
-                job.finished_at = time.time()
-                self._broadcast_job(job)
-                return
 
             # Lưu session JSON
             settings = load_settings()
@@ -616,6 +678,7 @@ class JobManager:
                 mfa_result = await enable_2fa(
                     access_token=result.access_token,
                     cookies=result.cookies,
+                    proxy=self._proxy,
                     log=log,
                 )
             except MfaError as exc:
@@ -762,6 +825,7 @@ class SessionJobManager:
         self._max = max_concurrent
         self._headless = True
         self._job_timeout = _DEFAULT_JOB_TIMEOUT
+        self._proxy: str | None = _DEFAULT_PROXY
         self._tasks: dict[str, asyncio.Task] = {}
         self._subscribers: set[asyncio.Queue] = set()
         self._job_queue: asyncio.Queue[str] = asyncio.Queue()
@@ -783,6 +847,10 @@ class SessionJobManager:
     def _ensure_workers(self) -> None:
         if not self._worker_started:
             self._worker_started = True
+        # Prune worker đã chết (bị cancel khi stop_all hoặc exit do exception).
+        # Không prune → len(self._workers) vẫn = _max → add jobs sau stop_all
+        # sẽ enqueue nhưng không worker nào pick lên.
+        self._workers = [w for w in self._workers if not w.done()]
         while len(self._workers) < self._max:
             w = asyncio.create_task(self._worker_loop())
             self._workers.append(w)
@@ -791,13 +859,16 @@ class SessionJobManager:
             w.cancel()
 
     async def _worker_loop(self) -> None:
+        # Job execution wrap trong inner task để stop_all cancel job mà không
+        # kill luôn worker. Nếu worker bị kill, các job add lại sau đó sẽ
+        # kẹt trong queue vì không ai pick lên.
         try:
             while True:
                 job_id = await self._job_queue.get()
                 job = self.jobs.get(job_id)
                 if job is None or job.status != "queued":
                     continue
-                # Stagger start nếu max_concurrent > 1
+                # Stagger reserve+sleep tách rời (xem JobManager._worker_loop).
                 if self._max > 1:
                     async with self._stagger_lock:
                         now = time.monotonic()
@@ -807,10 +878,35 @@ class SessionJobManager:
                                 self._stagger_min_seconds, self._stagger_max_seconds,
                             )
                             wait = max(wait_min, jitter)
-                            self._job_log(job, f"[stagger] đợi {wait:.1f}s trước khi start")
-                            await asyncio.sleep(wait)
-                        self._last_start_ts = time.monotonic()
-                await self._run_job(job)
+                            self._last_start_ts = now + wait
+                        else:
+                            wait = 0.0
+                            self._last_start_ts = now
+                    if wait > 0:
+                        self._job_log(job, f"[stagger] đợi {wait:.1f}s trước khi start")
+                        deadline = time.monotonic() + wait
+                        while True:
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                break
+                            await asyncio.sleep(min(0.25, remaining))
+                            cur = self.jobs.get(job_id)
+                            if cur is None or cur.status != "queued":
+                                break
+                    cur = self.jobs.get(job_id)
+                    if cur is None or cur.status != "queued":
+                        continue
+                inner = asyncio.create_task(self._run_job(job))
+                self._tasks[job_id] = inner
+                try:
+                    await inner
+                except asyncio.CancelledError:
+                    if inner.cancelled():
+                        # job bị cancel — worker tiếp tục vòng kế
+                        continue
+                    raise
+                finally:
+                    self._tasks.pop(job_id, None)
         except asyncio.CancelledError:
             pass
 
@@ -832,6 +928,20 @@ class SessionJobManager:
         if seconds < 30 or seconds > 600:
             raise ValueError("job_timeout phải trong [30, 600]")
         self._job_timeout = float(seconds)
+
+    @property
+    def proxy(self) -> str | None:
+        return self._proxy
+
+    def set_proxy(self, value: str | None) -> None:
+        if value is None:
+            self._proxy = None
+            return
+        v = str(value).strip()
+        self._proxy = v or None
+
+    def _safe_proxy_log(self) -> str:
+        return _mask_proxy(self._proxy)
 
     def subscribe(self) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue(maxsize=500)
@@ -918,13 +1028,17 @@ class SessionJobManager:
                 job.finished_at = time.time()
                 self._broadcast_job(job)
                 count += 1
+        # Reset stagger debt — batch jobs mới sau stop_all không phải đợi
+        # khoảng cách stagger tính từ batch cũ.
+        self._last_start_ts = 0.0
         return count
 
     def clear_finished(self) -> int:
+        """Xoá jobs đã xong (success/error). Giữ cancelled để user retry."""
         removed = 0
         for jid in list(self.order):
             job = self.jobs.get(jid)
-            if job and job.status in ("success", "error", "cancelled"):
+            if job and job.status in ("success", "error"):
                 self.jobs.pop(jid, None)
                 self.order.remove(jid)
                 self._tasks.pop(jid, None)
@@ -990,12 +1104,18 @@ class SessionJobManager:
             def log(msg: str) -> None:
                 self._job_log(job, msg)
 
+            if self._proxy:
+                log(f"[proxy] using {self._safe_proxy_log()}")
+
+            from ..config import env_insecure_tls
             session_data = await asyncio.wait_for(
                 get_session(
                     email=job.email,
                     password=job.password,
                     secret=job.secret,
                     headless=self._headless,
+                    proxy=self._proxy,
+                    tls_insecure=env_insecure_tls(),
                     log=log,
                 ),
                 timeout=self._job_timeout,
@@ -1047,7 +1167,7 @@ def get_session_manager() -> SessionJobManager:
 # LinkJobManager — Get Link feature
 # ─────────────────────────────────────────────────────────────────────
 
-from ..payment_link import get_checkout_url, PaymentLinkError  # noqa: E402
+from ..payment_link import get_checkout_url, PaymentLinkError, REGION_BILLING, DEFAULT_REGION  # noqa: E402
 
 
 LinkMode = Literal["combo", "session_json", "access_token"]
@@ -1060,6 +1180,7 @@ class LinkJob:
     password: str
     secret: str | None = None
     mode: LinkMode = "combo"
+    region: str = DEFAULT_REGION
     # Pre-provided token (dùng cho mode session_json / access_token)
     _access_token: str | None = field(default=None, repr=False)
     status: JobStatus = "queued"
@@ -1075,6 +1196,7 @@ class LinkJob:
             "id": self.id,
             "email": self.email,
             "mode": self.mode,
+            "region": self.region,
             "status": self.status,
             "error": self.error,
             "payment_link": self.payment_link,
@@ -1102,6 +1224,8 @@ class LinkJobManager:
         self._max = max_concurrent
         self._headless = True
         self._job_timeout = 180.0
+        self._proxy: str | None = _DEFAULT_PROXY
+        self._region: str = DEFAULT_REGION
         self._tasks: dict[str, asyncio.Task] = {}
         self._subscribers: set[asyncio.Queue] = set()
         self._job_queue: asyncio.Queue[str] = asyncio.Queue()
@@ -1123,6 +1247,10 @@ class LinkJobManager:
     def _ensure_workers(self) -> None:
         if not self._worker_started:
             self._worker_started = True
+        # Prune worker đã chết (bị cancel khi stop_all hoặc exit do exception).
+        # Không prune → len(self._workers) vẫn = _max → add jobs sau stop_all
+        # sẽ enqueue nhưng không worker nào pick lên.
+        self._workers = [w for w in self._workers if not w.done()]
         while len(self._workers) < self._max:
             w = asyncio.create_task(self._worker_loop())
             self._workers.append(w)
@@ -1131,13 +1259,16 @@ class LinkJobManager:
             w.cancel()
 
     async def _worker_loop(self) -> None:
+        # Job execution wrap trong inner task để stop_all cancel job mà không
+        # kill luôn worker. Nếu worker bị kill, các job add lại sau đó sẽ
+        # kẹt trong queue vì không ai pick lên.
         try:
             while True:
                 job_id = await self._job_queue.get()
                 job = self.jobs.get(job_id)
                 if job is None or job.status != "queued":
                     continue
-                # Stagger start nếu max_concurrent > 1
+                # Stagger reserve+sleep tách rời (xem JobManager._worker_loop).
                 if self._max > 1:
                     async with self._stagger_lock:
                         now = time.monotonic()
@@ -1147,10 +1278,35 @@ class LinkJobManager:
                                 self._stagger_min_seconds, self._stagger_max_seconds,
                             )
                             wait = max(wait_min, jitter)
-                            self._job_log(job, f"[stagger] đợi {wait:.1f}s trước khi start")
-                            await asyncio.sleep(wait)
-                        self._last_start_ts = time.monotonic()
-                await self._run_job(job)
+                            self._last_start_ts = now + wait
+                        else:
+                            wait = 0.0
+                            self._last_start_ts = now
+                    if wait > 0:
+                        self._job_log(job, f"[stagger] đợi {wait:.1f}s trước khi start")
+                        deadline = time.monotonic() + wait
+                        while True:
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                break
+                            await asyncio.sleep(min(0.25, remaining))
+                            cur = self.jobs.get(job_id)
+                            if cur is None or cur.status != "queued":
+                                break
+                    cur = self.jobs.get(job_id)
+                    if cur is None or cur.status != "queued":
+                        continue
+                inner = asyncio.create_task(self._run_job(job))
+                self._tasks[job_id] = inner
+                try:
+                    await inner
+                except asyncio.CancelledError:
+                    if inner.cancelled():
+                        # job bị cancel — worker tiếp tục vòng kế
+                        continue
+                    raise
+                finally:
+                    self._tasks.pop(job_id, None)
         except asyncio.CancelledError:
             pass
 
@@ -1172,6 +1328,29 @@ class LinkJobManager:
         if seconds < 30 or seconds > 600:
             raise ValueError("job_timeout phải trong [30, 600]")
         self._job_timeout = float(seconds)
+
+    @property
+    def proxy(self) -> str | None:
+        return self._proxy
+
+    def set_proxy(self, value: str | None) -> None:
+        if value is None:
+            self._proxy = None
+            return
+        v = str(value).strip()
+        self._proxy = v or None
+
+    @property
+    def region(self) -> str:
+        return self._region
+
+    def set_region(self, value: str) -> None:
+        if value not in REGION_BILLING:
+            raise ValueError(f"region phải là một trong: {list(REGION_BILLING.keys())}")
+        self._region = value
+
+    def _safe_proxy_log(self) -> str:
+        return _mask_proxy(self._proxy)
 
     def subscribe(self) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue(maxsize=500)
@@ -1199,17 +1378,18 @@ class LinkJobManager:
     def _broadcast_job(self, job: LinkJob) -> None:
         self._broadcast({"type": "job", "job": job.to_dict()})
 
-    def add_jobs(self, lines: list[str], *, mode: LinkMode = "combo") -> list[LinkJob]:
+    def add_jobs(self, lines: list[str], *, mode: LinkMode = "combo", region: str | None = None) -> list[LinkJob]:
         """Parse input based on mode. Dedup theo email."""
+        resolved_region = region or self._region
         existing_emails = {j.email.lower() for j in self.jobs.values() if j.status != "cancelled"}
         out: list[LinkJob] = []
 
         if mode == "combo":
-            out = self._parse_combo(lines, existing_emails)
+            out = self._parse_combo(lines, existing_emails, resolved_region)
         elif mode == "session_json":
-            out = self._parse_session_json(lines, existing_emails)
+            out = self._parse_session_json(lines, existing_emails, resolved_region)
         elif mode == "access_token":
-            out = self._parse_access_token(lines, existing_emails)
+            out = self._parse_access_token(lines, existing_emails, resolved_region)
         else:
             return out
 
@@ -1219,7 +1399,7 @@ class LinkJobManager:
                 self._job_queue.put_nowait(j.id)
         return out
 
-    def _parse_combo(self, lines: list[str], existing_emails: set[str]) -> list[LinkJob]:
+    def _parse_combo(self, lines: list[str], existing_emails: set[str], region: str) -> list[LinkJob]:
         """Mode combo: email|password|secret per line."""
         out: list[LinkJob] = []
         for raw in lines:
@@ -1231,7 +1411,7 @@ class LinkJobManager:
                 jid = uuid.uuid4().hex[:12]
                 job = LinkJob(
                     id=jid, email="<invalid>", password="",
-                    mode="combo",
+                    mode="combo", region=region,
                     status="error", error=f"format sai, cần email|password|secret: {line[:60]}",
                     finished_at=time.time(),
                 )
@@ -1250,14 +1430,14 @@ class LinkJobManager:
             existing_emails.add(email.lower())
 
             jid = uuid.uuid4().hex[:12]
-            job = LinkJob(id=jid, email=email, password=password, secret=secret, mode="combo")
+            job = LinkJob(id=jid, email=email, password=password, secret=secret, mode="combo", region=region)
             self.jobs[jid] = job
             self.order.append(jid)
             self._broadcast_job(job)
             out.append(job)
         return out
 
-    def _parse_session_json(self, lines: list[str], existing_emails: set[str]) -> list[LinkJob]:
+    def _parse_session_json(self, lines: list[str], existing_emails: set[str], region: str) -> list[LinkJob]:
         """Mode session_json: toàn bộ input là 1 JSON object duy nhất chứa accessToken."""
         out: list[LinkJob] = []
         full_text = "\n".join(lines).strip()
@@ -1319,7 +1499,7 @@ class LinkJobManager:
         jid = uuid.uuid4().hex[:12]
         job = LinkJob(
             id=jid, email=email, password="", mode="session_json",
-            _access_token=token,
+            region=region, _access_token=token,
         )
         self.jobs[jid] = job
         self.order.append(jid)
@@ -1327,7 +1507,7 @@ class LinkJobManager:
         out.append(job)
         return out
 
-    def _parse_access_token(self, lines: list[str], existing_emails: set[str]) -> list[LinkJob]:
+    def _parse_access_token(self, lines: list[str], existing_emails: set[str], region: str) -> list[LinkJob]:
         """Mode access_token: mỗi line là 1 raw JWT."""
         out: list[LinkJob] = []
         for raw in lines:
@@ -1345,7 +1525,7 @@ class LinkJobManager:
             jid = uuid.uuid4().hex[:12]
             job = LinkJob(
                 id=jid, email=email, password="", mode="access_token",
-                _access_token=token,
+                region=region, _access_token=token,
             )
             self.jobs[jid] = job
             self.order.append(jid)
@@ -1388,13 +1568,17 @@ class LinkJobManager:
                 job.finished_at = time.time()
                 self._broadcast_job(job)
                 count += 1
+        # Reset stagger debt — batch jobs mới sau stop_all không phải đợi
+        # khoảng cách stagger tính từ batch cũ.
+        self._last_start_ts = 0.0
         return count
 
     def clear_finished(self) -> int:
+        """Xoá jobs đã xong (success/error). Giữ cancelled để user retry."""
         removed = 0
         for jid in list(self.order):
             job = self.jobs.get(jid)
-            if job and job.status in ("success", "error", "cancelled"):
+            if job and job.status in ("success", "error"):
                 self.jobs.pop(jid, None)
                 self.order.remove(jid)
                 self._tasks.pop(jid, None)
@@ -1466,6 +1650,9 @@ class LinkJobManager:
             if job.mode == "combo":
                 # Login via browser → obtain token
                 log("[login] starting")
+                if self._proxy:
+                    log(f"[login] via proxy {self._safe_proxy_log()}")
+                from ..config import env_insecure_tls
                 try:
                     session_data = await asyncio.wait_for(
                         get_session(
@@ -1473,6 +1660,8 @@ class LinkJobManager:
                             password=job.password,
                             secret=job.secret,
                             headless=self._headless,
+                            proxy=self._proxy,
+                            tls_insecure=env_insecure_tls(),
                             log=log,
                         ),
                         timeout=self._job_timeout,
@@ -1515,10 +1704,12 @@ class LinkJobManager:
                 log(f"[token] using pre-provided token (mode={job.mode})")
 
             # ── Get payment link ──
-            log("[link] fetching payment URL")
+            log(f"[link] fetching payment URL (region={job.region})")
+            if self._proxy:
+                log(f"[link] via proxy {self._safe_proxy_log()}")
             try:
                 url = await asyncio.wait_for(
-                    get_checkout_url(access_token, proxy=None),
+                    get_checkout_url(access_token, region=job.region, proxy=self._proxy),
                     timeout=60.0,
                 )
             except asyncio.TimeoutError:
