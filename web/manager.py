@@ -397,15 +397,19 @@ class JobManager:
         """Thêm jobs từ list combo/email strings. Skip đã có trong list (dedup theo email)."""
         spec = get_spec(mail_mode)  # KeyError nếu mode lạ — server chặn trước
 
-        # Expand Gmail aliases với round-robin interleaving để tránh 2 alias cùng mail chạy song song
-        if gmail_alias_expand and mail_mode == "gmail_advanced":
+        # Expand aliases với round-robin interleaving để tránh 2 alias cùng mail chạy song song
+        # Hỗ trợ: gmail_advanced (sep=|) và smsbower (sep=----)
+        if gmail_alias_expand and mail_mode in ("gmail_advanced", "smsbower"):
             alias_count = max(1, min(int(gmail_alias_count), 10))
+            # Chọn separator phù hợp với mode
+            _sep = "----" if mail_mode == "smsbower" else "|"
             groups: list[list[str]] = []
             for raw in combos:
                 group = [raw]
                 line = raw.strip()
+                # gmail_advanced cho phép URL-only (bắt đầu http) — skip expand cho dạng này
                 if not (not line or line.startswith("#") or line.startswith(("http://", "https://"))):
-                    parts = line.split("|", 1)
+                    parts = line.split(_sep, 1)
                     if len(parts) == 2:
                         base_email = parts[0].strip()
                         api_url = parts[1].strip()
@@ -413,7 +417,7 @@ class JobManager:
                             local_part = base_email.split("+")[0].split("@")[0]
                             domain = base_email.split("@", 1)[1]
                             aliases = _generate_gmail_aliases(local_part, domain, alias_count)
-                            group.extend(f"{a}|{api_url}" for a in aliases)
+                            group.extend(f"{a}{_sep}{api_url}" for a in aliases)
                 groups.append(group)
             # Round-robin: [orig1,orig2,...] → [alias1_1,alias2_1,...] → [alias1_2,alias2_2,...]
             max_len = max((len(g) for g in groups), default=0)
@@ -1310,6 +1314,8 @@ class LinkJob:
     log_lines: list[str] = field(default_factory=list)
     error: str | None = None
     payment_link: str | None = None
+    user_id: str | None = None
+    screenshot_urls: list[str] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
     started_at: float | None = None
     finished_at: float | None = None
@@ -1323,6 +1329,8 @@ class LinkJob:
             "status": self.status,
             "error": self.error,
             "payment_link": self.payment_link,
+            "user_id": self.user_id,
+            "screenshot_urls": list(self.screenshot_urls),
             "created_at": self.created_at,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
@@ -1561,73 +1569,96 @@ class LinkJobManager:
         return out
 
     def _parse_session_json(self, lines: list[str], existing_emails: set[str], region: str) -> list[LinkJob]:
-        """Mode session_json: toàn bộ input là 1 JSON object duy nhất chứa accessToken."""
+        """Mode session_json: hỗ trợ 1 JSON object trải nhiều dòng HOẶC nhiều JSON
+        objects, mỗi dòng = 1 account.
+        """
         out: list[LinkJob] = []
-        full_text = "\n".join(lines).strip()
-        if not full_text:
+        raw_lines = [ln for ln in lines if ln.strip() and not ln.lstrip().startswith("#")]
+        if not raw_lines:
             return out
 
+        # Detect format: thử parse toàn bộ làm 1 JSON; nếu fail → parse từng dòng
+        full_text = "\n".join(raw_lines).strip()
+        json_blobs: list[str] = []
         try:
-            data = json.loads(full_text)
-        except (json.JSONDecodeError, ValueError) as exc:
+            single = json.loads(full_text)
+            if isinstance(single, list):
+                json_blobs = [json.dumps(obj) for obj in single]
+            elif isinstance(single, dict):
+                json_blobs = [full_text]
+            else:
+                json_blobs = []
+        except (json.JSONDecodeError, ValueError):
+            json_blobs = [ln.strip() for ln in raw_lines]
+
+        for blob in json_blobs:
+            blob = blob.strip()
+            if not blob:
+                continue
+
+            try:
+                data = json.loads(blob)
+            except (json.JSONDecodeError, ValueError) as exc:
+                jid = uuid.uuid4().hex[:12]
+                job = LinkJob(
+                    id=jid, email="<invalid>", password="",
+                    mode="session_json",
+                    status="error", error=f"invalid JSON: {exc}",
+                    finished_at=time.time(),
+                )
+                self.jobs[jid] = job
+                self.order.append(jid)
+                self._broadcast_job(job)
+                out.append(job)
+                continue
+
+            if not isinstance(data, dict):
+                jid = uuid.uuid4().hex[:12]
+                job = LinkJob(
+                    id=jid, email="<invalid>", password="",
+                    mode="session_json",
+                    status="error", error="JSON phải là object",
+                    finished_at=time.time(),
+                )
+                self.jobs[jid] = job
+                self.order.append(jid)
+                self._broadcast_job(job)
+                out.append(job)
+                continue
+
+            token = data.get("accessToken") or data.get("access_token") or ""
+            user = data.get("user") or {}
+            email = user.get("email") or f"token_{uuid.uuid4().hex[:6]}"
+            user_id = user.get("id") or data.get("userId") or data.get("user_id")
+
+            if not token:
+                jid = uuid.uuid4().hex[:12]
+                job = LinkJob(
+                    id=jid, email=email, password="",
+                    mode="session_json",
+                    status="error", error="thiếu accessToken",
+                    finished_at=time.time(),
+                )
+                self.jobs[jid] = job
+                self.order.append(jid)
+                self._broadcast_job(job)
+                out.append(job)
+                continue
+
+            if email.lower() in existing_emails:
+                continue
+            existing_emails.add(email.lower())
+
             jid = uuid.uuid4().hex[:12]
             job = LinkJob(
-                id=jid, email="<invalid>", password="",
-                mode="session_json",
-                status="error", error=f"invalid JSON: {exc}",
-                finished_at=time.time(),
+                id=jid, email=email, password="", mode="session_json",
+                region=region, _access_token=token, user_id=user_id,
             )
             self.jobs[jid] = job
             self.order.append(jid)
             self._broadcast_job(job)
             out.append(job)
-            return out
 
-        if not isinstance(data, dict):
-            jid = uuid.uuid4().hex[:12]
-            job = LinkJob(
-                id=jid, email="<invalid>", password="",
-                mode="session_json",
-                status="error", error="JSON phải là object, không phải array/primitive",
-                finished_at=time.time(),
-            )
-            self.jobs[jid] = job
-            self.order.append(jid)
-            self._broadcast_job(job)
-            out.append(job)
-            return out
-
-        token = data.get("accessToken") or ""
-        user = data.get("user") or {}
-        email = user.get("email") or f"token_{uuid.uuid4().hex[:6]}"
-
-        if not token:
-            jid = uuid.uuid4().hex[:12]
-            job = LinkJob(
-                id=jid, email=email, password="",
-                mode="session_json",
-                status="error", error="session JSON thiếu accessToken",
-                finished_at=time.time(),
-            )
-            self.jobs[jid] = job
-            self.order.append(jid)
-            self._broadcast_job(job)
-            out.append(job)
-            return out
-
-        if email.lower() in existing_emails:
-            return out
-        existing_emails.add(email.lower())
-
-        jid = uuid.uuid4().hex[:12]
-        job = LinkJob(
-            id=jid, email=email, password="", mode="session_json",
-            region=region, _access_token=token,
-        )
-        self.jobs[jid] = job
-        self.order.append(jid)
-        self._broadcast_job(job)
-        out.append(job)
         return out
 
     def _parse_access_token(self, lines: list[str], existing_emails: set[str], region: str) -> list[LinkJob]:

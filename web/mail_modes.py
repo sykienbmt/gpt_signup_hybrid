@@ -11,7 +11,11 @@ import re
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from ..mail_providers import OutlookCombo, OutlookComboError, GmailAdvancedProvider, GmailAdvancedParseError
+from ..mail_providers import (
+    OutlookCombo, OutlookComboError,
+    GmailAdvancedProvider, GmailAdvancedParseError,
+    SmsBowerProvider, SmsBowerParseError,
+)
 from ..models import SignupRequest
 
 
@@ -24,6 +28,10 @@ class MailModeParseError(Exception):
 
 class GmailAdvancedModeParseError(MailModeParseError):
     """Parse line fail cho Gmail Advanced mode."""
+
+
+class SmsBowerModeParseError(MailModeParseError):
+    """Parse line fail cho SmsBower mode."""
 
 
 # ─── Data types ───────────────────────────────────────────────────────
@@ -220,6 +228,60 @@ GMAIL_ADVANCED_MODE = MailModeSpec(
 )
 
 
+# ─── SmsBower mode ────────────────────────────────────────────────────
+
+
+def _parse_smsbower_line(line: str) -> ParsedLine:
+    """Parse line `email----api_url` cho SmsBower."""
+    try:
+        email, api_url = SmsBowerProvider.parse_line(line)
+    except SmsBowerParseError as exc:
+        raise SmsBowerModeParseError(str(exc)) from exc
+    return ParsedLine(email=email, raw=line)
+
+
+def _build_smsbower_request(
+    parsed: ParsedLine,
+    *,
+    worker_config: dict[str, str] | None = None,
+    password: str | None = None,
+    headless: bool = True,
+    keep_browser_open: bool = False,
+    proxy: str | None = None,
+) -> SignupRequest:
+    raw = parsed.raw.strip()
+    parts = raw.split(SmsBowerProvider.SEPARATOR, 1)
+    email = parts[0].strip()
+    api_url = parts[1].strip() if len(parts) == 2 else ""
+
+    from ..config import env_insecure_tls
+    return SignupRequest(
+        email=email,
+        mail_provider="smsbower",
+        smsbower_api_url=api_url,
+        otp_timeout_seconds=70.0,       # 7s delay + 30s poll + resend + 30s poll
+        otp_initial_delay_seconds=7.0,  # chờ 7s trước khi gọi API lần đầu
+        otp_max_resends=1,              # resend tối đa 1 lần, sau đó skip job
+        otp_poll_interval_seconds=3.0,
+        headless=headless,
+        keep_browser_open=keep_browser_open,
+        password=password,
+        proxy=proxy,
+        tls_insecure=env_insecure_tls(),
+    )
+
+
+SMSBOWER_MODE = MailModeSpec(
+    id="smsbower",
+    label="SmsBower (API)",
+    input_placeholder="gaylelauro9452100@gmail.com----smsbower.page/api/mail/getCodeBySignature?s=...",
+    input_help="Mỗi dòng: email----api_url (phân cách bằng 4 dấu gạch ngang). Pre-check status=1 trước khi chạy.",
+    config_schema=[],
+    parse_line=_parse_smsbower_line,
+    build_request=_build_smsbower_request,
+)
+
+
 # ─── Registry ─────────────────────────────────────────────────────────
 
 
@@ -227,6 +289,7 @@ _REGISTRY: dict[str, MailModeSpec] = {
     OUTLOOK_MODE.id: OUTLOOK_MODE,
     WORKER_MODE.id: WORKER_MODE,
     GMAIL_ADVANCED_MODE.id: GMAIL_ADVANCED_MODE,
+    SMSBOWER_MODE.id: SMSBOWER_MODE,
 }
 
 

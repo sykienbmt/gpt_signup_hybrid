@@ -14,6 +14,7 @@ from .mail_providers import (
     OutlookProviderUnavailable,
     build_provider_gmail_advanced,
     build_provider_outlook,
+    build_provider_smsbower,
     build_provider_worker,
 )
 from .models import SignupRequest, SignupResult
@@ -41,6 +42,13 @@ def _build_mail_provider(request: SignupRequest, *, settings) -> MailProvider:
         return build_provider_gmail_advanced(
             email=provider_email,
             api_url=request.gmail_api_url,
+        )
+    if request.mail_provider == "smsbower":
+        if not request.smsbower_api_url:
+            raise ValueError("mail_provider='smsbower' yêu cầu smsbower_api_url")
+        return build_provider_smsbower(
+            email=request.email,
+            api_url=request.smsbower_api_url,
         )
     if request.mail_provider == "worker":
         return build_provider_worker(

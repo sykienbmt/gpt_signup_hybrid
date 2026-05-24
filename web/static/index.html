@@ -17,6 +17,8 @@
     <button class="tab-btn active" data-tab="reg">Reg</button>
     <button class="tab-btn" data-tab="session">Get Session</button>
     <button class="tab-btn" data-tab="link">Get Link</button>
+    <button class="tab-btn" data-tab="check">Check Account</button>
+    <button class="tab-btn" data-tab="converter">Converter</button>
   </nav>
   <div class="topbar-actions">
     <label class="select-wrap">
@@ -223,8 +225,8 @@
     <header class="card-head">
       <h2>Input</h2>
       <div class="link-mode-tabs">
-        <button class="link-mode-btn active" data-mode="combo">Combo</button>
-        <button class="link-mode-btn" data-mode="session_json">Session JSON</button>
+        <button class="link-mode-btn" data-mode="combo">Combo</button>
+        <button class="link-mode-btn active" data-mode="session_json">Session JSON</button>
         <button class="link-mode-btn" data-mode="access_token">Access Token</button>
       </div>
     </header>
@@ -285,6 +287,112 @@
   </section>
 </main>
 
+<!-- ════════════════ TAB: CHECK ACCOUNT ════════════════ -->
+<main class="grid grid-check tab-content" id="tab-check">
+  <section class="card card-input">
+    <header class="card-head">
+      <h2>Input Accounts</h2>
+      <span class="muted card-head-note">One line per account: email|pass|2fa|Session (Session = JWT accessToken hoặc session JSON)</span>
+    </header>
+    <textarea class="combo-textarea" id="check-input"
+      placeholder="email@hotmail.com|pass|DNPARKKMM5EYOPDG...|eyJhbGciOi...&#10;email2@outlook.com|pass2|I77PEBZQN...|{&quot;accessToken&quot;:&quot;eyJ...&quot;}"></textarea>
+    <div class="card-settings">
+      <label class="input-group settings-field-compact">
+        <span class="input-label">Concurrent</span>
+        <input type="number" id="check-concurrent" value="5" min="1" max="10" step="1" />
+      </label>
+    </div>
+    <div class="card-actions">
+      <button id="check-btn-run" class="btn btn-primary">Check</button>
+      <button id="check-btn-clear-input" class="btn btn-ghost">Clear Input</button>
+      <button id="check-btn-clear-results" class="btn btn-ghost">Clear Results</button>
+      <button id="check-btn-clear-all" class="btn btn-danger">Clear All</button>
+      <span class="muted" id="check-input-count">0 accounts</span>
+    </div>
+  </section>
+
+  <section class="card card-jobs">
+    <header class="card-head">
+      <h2>Results</h2>
+      <div class="card-head-actions">
+        <button id="check-btn-copy-plus" class="btn btn-ghost btn-small" title="Copy chỉ những account Plus">Copy Plus</button>
+        <button id="check-btn-copy-all" class="btn btn-ghost btn-small">Copy All</button>
+        <span class="muted" id="check-summary">0 total</span>
+      </div>
+    </header>
+    <div id="check-result-list" class="job-list">
+      <div class="empty">Paste account lines and click Check.</div>
+    </div>
+  </section>
+</main>
+
+<!-- ════════════════ TAB: CONVERTER ════════════════ -->
+<main class="tab-content conv-layout" id="tab-converter">
+  <section class="card conv-panel">
+    <header class="card-head">
+      <div>
+        <h2>Session JSON</h2>
+        <span class="muted card-head-note">Paste ChatGPT session JSON, hoặc kéo thả file .json vào đây</span>
+      </div>
+    </header>
+    <div class="conv-guide">
+      <strong>Lấy session tại:</strong>
+      <a href="https://chatgpt.com/api/auth/session" target="_blank" rel="noreferrer">chatgpt.com/api/auth/session</a>
+      — copy toàn bộ JSON rồi paste xuống dưới.
+    </div>
+    <div class="card-actions">
+      <input class="hidden" id="conv-file-input" type="file" accept=".json,application/json" multiple />
+      <button class="btn btn-ghost btn-small" id="conv-pick-files">Select Files</button>
+      <button class="btn btn-ghost btn-small" id="conv-load-example">Example</button>
+      <button class="btn btn-ghost btn-small" id="conv-clear">Clear</button>
+    </div>
+    <textarea class="conv-textarea" id="conv-input" spellcheck="false"
+      placeholder='{"user":{"email":"you@example.com"},"expires":"2026-08-06T14:29:36.155Z","account":{"id":"...","planType":"plus"},"accessToken":"...","sessionToken":"..."}'>
+    </textarea>
+    <div class="conv-status" id="conv-input-status">Waiting for input.</div>
+  </section>
+
+  <section class="card conv-panel">
+    <header class="card-head">
+      <div>
+        <h2>Output</h2>
+        <span class="muted card-head-note" id="conv-output-subtitle">Format: sub2api</span>
+      </div>
+      <div class="card-head-actions">
+        <button class="btn btn-ghost btn-small" id="conv-copy" disabled>Copy</button>
+        <button class="btn btn-primary btn-small" id="conv-download" disabled>Download JSON</button>
+      </div>
+    </header>
+
+    <div class="conv-format-bar" role="group">
+      <button class="conv-fmt-btn active" data-format="sub2api">sub2api</button>
+      <button class="conv-fmt-btn" data-format="cpa">CPA</button>
+      <button class="conv-fmt-btn" data-format="cockpit">Cockpit</button>
+      <button class="conv-fmt-btn" data-format="9router">9router</button>
+      <button class="conv-fmt-btn" data-format="axonhub">AxonHub</button>
+      <button class="conv-fmt-btn" data-format="codexmanager">Codex-Manager</button>
+    </div>
+
+    <div class="conv-stats">
+      <div class="conv-stat"><span class="conv-stat-val" id="conv-stat-count">0</span><span class="conv-stat-label">Accounts</span></div>
+      <div class="conv-stat"><span class="conv-stat-val" id="conv-stat-format">sub2api</span><span class="conv-stat-label">Format</span></div>
+      <div class="conv-stat"><span class="conv-stat-val" id="conv-stat-errors">0</span><span class="conv-stat-label">Skipped</span></div>
+    </div>
+
+    <div class="conv-accounts-wrap">
+      <table class="conv-table">
+        <colgroup><col style="width:30%"/><col style="width:40%"/><col style="width:30%"/></colgroup>
+        <thead><tr><th>Name</th><th>Email</th><th>Expires</th></tr></thead>
+        <tbody id="conv-account-body"><tr><td colspan="3" class="conv-empty">No accounts yet.</td></tr></tbody>
+      </table>
+    </div>
+
+    <div class="conv-issues hidden" id="conv-issues"></div>
+    <textarea class="conv-textarea conv-output" id="conv-output" readonly spellcheck="false" placeholder="Output will appear here."></textarea>
+    <div class="conv-status" id="conv-output-status">No output yet.</div>
+  </section>
+</main>
+
 <!-- QR modal -->
 <div id="qr-modal" class="qr-modal hidden" role="dialog" aria-modal="true">
   <div class="qr-modal-backdrop"></div>
@@ -298,9 +406,25 @@
   </div>
 </div>
 
+<div id="shot-modal" class="qr-modal hidden" role="dialog" aria-modal="true">
+  <div class="qr-modal-backdrop" data-shot-close></div>
+  <div class="qr-modal-box">
+    <div class="qr-modal-header">
+      <span class="qr-modal-title">Screenshot</span>
+      <button id="shot-modal-close" class="icon-btn" title="Close">✕</button>
+    </div>
+    <div class="shot-modal-img-wrap">
+      <img id="shot-modal-img" alt="Screenshot" />
+    </div>
+    <div id="shot-modal-url" class="qr-modal-url muted"></div>
+  </div>
+</div>
+
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 <script src="/static/app.js?v=__ASSET_VERSION__"></script>
 <script src="/static/session.js?v=__ASSET_VERSION__"></script>
 <script src="/static/link.js?v=__ASSET_VERSION__"></script>
+<script src="/static/check.js?v=__ASSET_VERSION__"></script>
+<script src="/static/converter.js?v=__ASSET_VERSION__"></script>
 </body>
 </html>

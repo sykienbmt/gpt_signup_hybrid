@@ -8,8 +8,8 @@
       placeholder: 'email@hotmail.com|password123|DNPARKKMM5EYOPDG...\nemail2@outlook.com|pass456|I77PEBZQNEBE67SU...',
     },
     session_json: {
-      hint: 'Paste one session JSON object (from /api/auth/session)',
-      placeholder: '{\n  "accessToken": "eyJhbGci...",\n  "user": { "email": "user@example.com", ... },\n  ...\n}',
+      hint: 'One session JSON per line (each line = 1 account). Hỗ trợ paste 1 JSON nhiều dòng hoặc array.',
+      placeholder: '{"accessToken":"eyJhbGci...","user":{"email":"a@x.com"}}\n{"accessToken":"eyJabc...","user":{"email":"b@x.com"}}',
     },
     access_token: {
       hint: 'One raw accessToken (JWT) per line',
@@ -22,8 +22,10 @@
     order: [],
     activeJobId: null,
     maxConcurrent: 1,
-    mode: 'combo',
+    mode: 'session_json',
     region: 'VN',
+    upiInProgress: new Set(),
+    upiDone: new Set(),
   };
 
   const $ = (id) => document.getElementById(id);
@@ -92,8 +94,20 @@
         return trimmed && !trimmed.startsWith('#');
       }).length;
     } else if (state.mode === 'session_json') {
-      // Single JSON only — valid or not
-      count = text.length > 0 ? 1 : 0;
+      // Đếm số JSON object: thử parse cả block; fallback theo dòng
+      if (!text) {
+        count = 0;
+      } else {
+        try {
+          const parsed = JSON.parse(text);
+          count = Array.isArray(parsed) ? parsed.length : 1;
+        } catch {
+          count = text.split('\n').filter((line) => {
+            const trimmed = line.trim();
+            return trimmed && !trimmed.startsWith('#');
+          }).length;
+        }
+      }
     }
 
     const label = state.mode === 'session_json' ? 'session' : 'item';
@@ -131,6 +145,19 @@
           `<button class="icon-btn" data-action="copy-link" data-id="${escHtml(id)}" title="Copy payment link">${window.GptUi.icon('link')}</button>`,
           `<button class="icon-btn" data-action="show-qr" data-id="${escHtml(id)}" title="Show QR code">▣</button>`,
         );
+        if (job.region === 'IN') {
+          const upiBusy = state.upiInProgress.has(id);
+          const upiDone = state.upiDone.has(id);
+          let upiLabel;
+          if (upiBusy) upiLabel = '<span class="upi-spinner"></span>';
+          else if (upiDone) upiLabel = '✅';
+          else upiLabel = '🇮🇳 UPI';
+          const upiAttrs = upiBusy ? 'disabled' : '';
+          const upiTitle = upiDone ? 'UPI filled — click to re-run' : 'Auto fill UPI &amp; subscribe';
+          actions.push(
+            `<button class="icon-btn upi-btn" data-action="upi-fill" data-id="${escHtml(id)}" title="${upiTitle}" ${upiAttrs}>${upiLabel}</button>`,
+          );
+        }
       }
       if (job.status === 'running') {
         actions.push(
@@ -149,6 +176,12 @@
         ? `<div class="job-meta" title="${escHtml(job.payment_link)}">${escHtml(job.payment_link)}</div>`
         : '';
 
+      const shots = (job.screenshot_urls && job.screenshot_urls.length)
+        ? `<div class="job-meta">📸 ${job.screenshot_urls.map((u, i) =>
+            `<a href="${escHtml(u)}" data-action="show-shot" data-url="${escHtml(u)}" class="shot-link" title="${escHtml(u)}">shot${job.screenshot_urls.length > 1 ? (i + 1) : ''}</a>`
+          ).join(' · ')}</div>`
+        : '';
+
       const modeTag = job.mode && job.mode !== 'combo' ? `<span class="muted">[${escHtml(job.mode)}]</span> ` : '';
 
       return `
@@ -158,6 +191,7 @@
           <div class="job-main">
             <div class="job-email" title="${escHtml(job.email)}">${modeTag}${escHtml(job.email)}</div>
             ${meta}
+            ${shots}
           </div>
           <div class="job-duration">${escHtml(fmtDuration(job.duration))}</div>
           <div class="job-actions">${actions.join('')}</div>
@@ -275,6 +309,26 @@
       } else if (action === 'show-qr') {
         const job = state.jobs.get(id);
         if (job && job.payment_link) showQrModal(job.payment_link);
+      } else if (action === 'show-shot') {
+        event.preventDefault();
+        const url = actionBtn.dataset.url;
+        if (url) showShotModal(url);
+      } else if (action === 'upi-fill') {
+        if (state.upiInProgress.has(id)) return;
+        state.upiInProgress.add(id);
+        renderJobs();
+        api(`/api/link/jobs/${id}/upi-fill`, { method: 'POST' })
+          .then((res) => {
+            if (res.ok) state.upiDone.add(id);
+            else alert('UPI fill failed: ' + (res.error || 'unknown'));
+          })
+          .catch((err) => {
+            alert('UPI fill error: ' + err.message);
+          })
+          .finally(() => {
+            state.upiInProgress.delete(id);
+            renderJobs();
+          });
       } else if (action === 'retry') {
         api(`/api/link/jobs/${id}/retry`, { method: 'POST' }).catch((err) => alert(err.message));
       } else if (action === 'stop' || action === 'remove') {
@@ -380,7 +434,28 @@
   qrModalBackdrop.addEventListener('click', closeQrModal);
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape' && !qrModal.classList.contains('hidden')) closeQrModal();
+    if (e.key === 'Escape' && !shotModal.classList.contains('hidden')) closeShotModal();
   });
+
+  // ─── Screenshot Modal ───
+  const shotModal = document.getElementById('shot-modal');
+  const shotModalImg = document.getElementById('shot-modal-img');
+  const shotModalUrl = document.getElementById('shot-modal-url');
+  const shotModalClose = document.getElementById('shot-modal-close');
+
+  function showShotModal(url) {
+    shotModalImg.src = url;
+    shotModalUrl.textContent = url;
+    shotModal.classList.remove('hidden');
+  }
+  function closeShotModal() {
+    shotModal.classList.add('hidden');
+    shotModalImg.src = '';
+  }
+  shotModalClose.addEventListener('click', closeShotModal);
+  shotModal.querySelectorAll('[data-shot-close]').forEach((el) =>
+    el.addEventListener('click', closeShotModal)
+  );
 
   dom.comboInput.addEventListener('input', updateComboCount);
   updateComboCount();

@@ -534,14 +534,19 @@ async def _drive_signup_flow(
             t_otp = time.monotonic()
             recipient = request.source_email or request.email
             log(f"[flow] polling OTP (recipient={recipient}) since {poll_started.isoformat()}")
-            
+
+            # Delay trước lần poll đầu (nếu provider cần thời gian xử lý)
+            if request.otp_initial_delay_seconds > 0:
+                log(f"[flow] waiting {request.otp_initial_delay_seconds:.0f}s before first OTP poll...")
+                await asyncio.sleep(request.otp_initial_delay_seconds)
+
             # Poll OTP, skip codes đã thử.
             # Nếu đợi >30s chưa có code mới → click Resend rồi poll tiếp.
             # iCloud có thể gửi mail mới trước, mail cũ delay → lấy nhiều codes
             # rồi thử lần lượt trước khi resend.
             resend_after_seconds = 30.0
             resend_count = 0
-            max_resends = 3  # tối đa resend 3 lần trong 1 lượt OTP
+            max_resends = request.otp_max_resends  # configurable per provider
             stale_poll_count = 0  # đếm lần poll liên tiếp chỉ nhận code cũ
             stale_poll_resend_threshold = 5  # sau 5 lần poll chỉ code cũ → resend
             while True:
@@ -604,7 +609,7 @@ async def _drive_signup_flow(
                         log(f"[flow] OTP={otp_code} đã thử rồi, tiếp tục poll... ({stale_poll_count}/{stale_poll_resend_threshold})")
                         await asyncio.sleep(request.otp_poll_interval_seconds)
                     continue
-                # otp_code is None → timeout thật sự, không code nào về → resend
+                # otp_code is None → timeout thật sự, không code nào về → resend hoặc fail
                 if resend_count < max_resends:
                     resend_count += 1
                     log(f"[flow] OTP chưa nhận sau {mini_timeout:.0f}s — click Resend ({resend_count}/{max_resends})")
@@ -617,6 +622,12 @@ async def _drive_signup_flow(
                     # Reset poll_started để chỉ nhận code mới sau resend
                     await asyncio.sleep(2.0)
                     poll_started = datetime.now(timezone.utc).replace(microsecond=0)
+                else:
+                    # Đã hết lượt resend mà vẫn không có code → bỏ job này
+                    raise BrowserPhaseError(
+                        f"OTP không nhận được sau {resend_count} lần resend "
+                        f"({mini_timeout:.0f}s/lần) — skip job"
+                    )
             
             otp_seconds_total += time.monotonic() - t_otp
             log(f"[flow] OTP={otp_code} got in {time.monotonic() - t_otp:.1f}s")

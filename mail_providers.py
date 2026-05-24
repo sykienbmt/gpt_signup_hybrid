@@ -30,6 +30,48 @@ _OTP_REGEX = re.compile(
 )
 
 
+# ─────────────────────────────────────────────────────────────────────
+# OTP Claim Registry
+# Nhiều alias cùng poll 1 api_url sẽ thấy chung các OTP codes.
+# Registry này đảm bảo mỗi code chỉ được 1 job dùng.
+#
+# asyncio single-threaded → check-and-add giữa 2 await là atomic,
+# không cần Lock.
+# ─────────────────────────────────────────────────────────────────────
+
+# api_url → set[code] đã được claimed bởi một job
+_CLAIMED_OTPS: dict[str, set[str]] = {}
+
+
+def _try_claim_otp(api_url: str, code: str) -> bool:
+    """Claim code cho api_url. Return True nếu claim thành công (chưa ai dùng)."""
+    claimed = _CLAIMED_OTPS.setdefault(api_url, set())
+    if code in claimed:
+        return False
+    claimed.add(code)
+    return True
+
+
+def _pick_unclaimed_otp(api_url: str, raw_entries: list[Any]) -> str | None:
+    """Duyệt entries từ mới nhất → cũ nhất, claim code đầu tiên chưa bị lấy.
+
+    Mỗi entry có thể là:
+        - str / int  → code trực tiếp
+        - dict       → đọc field "otp", "code"
+
+    Return code nếu claim được, None nếu không có code nào còn trống.
+    """
+    for entry in reversed(raw_entries):
+        if isinstance(entry, dict):
+            c = str(entry.get("otp") or entry.get("code") or "").strip()
+        else:
+            c = str(entry).strip()
+        if c and len(c) == 6 and c.isdigit():
+            if _try_claim_otp(api_url, c):
+                return c
+    return None
+
+
 def _parse_dt(value: Any) -> datetime | None:
     """Parse datetime từ nhiều format khác nhau."""
     if not value:
@@ -726,24 +768,32 @@ class GmailAdvancedProvider:
                         else:
                             otp = str(data.get("otp") or "").strip()
                             if otp and len(otp) == 6 and otp.isdigit():
-                                log(f"[otp:gmail_advanced] found OTP {otp} (attempt {attempt})")
-                                return otp
+                                if _try_claim_otp(self.api_url, otp):
+                                    log(f"[otp:gmail_advanced] found OTP {otp} (attempt {attempt})")
+                                    return otp
+                                else:
+                                    log(
+                                        f"[otp:gmail_advanced] OTP {otp} already claimed by another alias "
+                                        f"— searching history... (attempt {attempt})"
+                                    )
 
-                            # Check otp_history — lấy code mới nhất nếu có
+                            # Check otp_history — tìm code chưa bị alias khác claim
                             otp_history = data.get("otp_history")
                             if isinstance(otp_history, list) and otp_history:
-                                # otp_history có thể là list string hoặc list dict
-                                latest = otp_history[-1]
-                                if isinstance(latest, dict):
-                                    code = str(latest.get("otp") or latest.get("code") or "").strip()
-                                else:
-                                    code = str(latest).strip()
-                                if code and len(code) == 6 and code.isdigit():
-                                    log(f"[otp:gmail_advanced] found OTP from history {code} (attempt {attempt})")
+                                code = _pick_unclaimed_otp(self.api_url, otp_history)
+                                if code:
+                                    log(
+                                        f"[otp:gmail_advanced] found unclaimed OTP from history "
+                                        f"{code} (attempt {attempt})"
+                                    )
                                     return code
 
                             if attempt <= 3 or attempt % 5 == 0:
-                                log(f"[otp:gmail_advanced] waiting... otp='{otp}' attempt {attempt}")
+                                claimed_count = len(_CLAIMED_OTPS.get(self.api_url, set()))
+                                log(
+                                    f"[otp:gmail_advanced] waiting... "
+                                    f"otp='{otp}' claimed_pool={claimed_count} attempt {attempt}"
+                                )
                 except (httpx.HTTPError, ValueError) as exc:
                     log(f"[otp:gmail_advanced] error attempt {attempt}: {exc}")
 
@@ -751,6 +801,173 @@ class GmailAdvancedProvider:
                 if remaining <= 0:
                     raise TimeoutError(
                         f"OTP timeout after {timeout_seconds}s for {self.email} (gmail_advanced)"
+                    )
+                await asyncio.sleep(min(poll_interval_seconds, remaining))
+
+
+# ─────────────────────────────────────────────────────────────────────
+# SmsBower provider (smsbower.page API)
+# ─────────────────────────────────────────────────────────────────────
+
+
+class SmsBowerParseError(Exception):
+    """Parse input line fail cho SmsBower mode."""
+
+
+class SmsBowerProvider:
+    """Provider poll OTP qua API smsbower.page.
+
+    Input format: email----api_url
+    API response:
+        {
+            "status": 1,        ← 1 = live/waiting, khác 1 = terminal
+            "code": null,       ← fill khi có OTP (string 6 digits)
+            "all_codes": []     ← list tất cả codes đã nhận
+        }
+
+    Poll logic: gọi GET api_url liên tục, khi field `code` có giá trị 6 số → return.
+    Fallback `all_codes` nếu `code` null nhưng history có.
+    Terminal: `status != 1` và không có code → raise TimeoutError.
+    """
+
+    SEPARATOR = "----"
+
+    def __init__(self, *, api_url: str, email: str):
+        if not api_url:
+            raise ValueError("SmsBower api_url is required")
+        if not email:
+            raise ValueError("SmsBower email is required")
+        # Normalize URL — auto-thêm https:// nếu thiếu scheme
+        if not api_url.startswith(("http://", "https://")):
+            api_url = "https://" + api_url
+        self.api_url = api_url
+        self.email = email
+
+    @classmethod
+    def parse_line(cls, line: str) -> tuple[str, str]:
+        """Parse line → (email, api_url).
+
+        Format bắt buộc: email----api_url
+        (phân cách bởi 4 dấu gạch ngang `----`)
+
+        Raises SmsBowerParseError nếu format sai.
+        """
+        stripped = line.strip()
+        if cls.SEPARATOR not in stripped:
+            raise SmsBowerParseError(
+                f"format phải là email----api_url (phân cách bằng '----'), nhận: {line[:80]}"
+            )
+        parts = stripped.split(cls.SEPARATOR, 1)
+        email_part = parts[0].strip()
+        url_part = parts[1].strip()
+        if not email_part or "@" not in email_part:
+            raise SmsBowerParseError(f"email không hợp lệ: {email_part!r}")
+        if not url_part:
+            raise SmsBowerParseError("api_url rỗng sau '----'")
+        return email_part, url_part
+
+    async def pre_check(self, *, log) -> None:
+        """Gọi API 1 lần để verify status == 1 trước khi chạy signup.
+
+        Raise ValueError nếu API không reachable hoặc status != 1.
+        """
+        log(f"[otp:smsbower] pre-check: {self.api_url}")
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            try:
+                response = await client.get(self.api_url)
+            except httpx.HTTPError as exc:
+                raise ValueError(
+                    f"SmsBower pre-check failed (network): {type(exc).__name__}: {exc}"
+                ) from exc
+
+        if response.status_code != 200:
+            raise ValueError(
+                f"SmsBower pre-check HTTP {response.status_code}: {response.text[:200]}"
+            )
+
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise ValueError("SmsBower pre-check: response không phải JSON") from exc
+
+        status = data.get("status")
+        if status != 1:
+            raise ValueError(
+                f"SmsBower pre-check failed: status={status} (cần 1) — "
+                f"email={self.email}, dừng job."
+            )
+
+        log(f"[otp:smsbower] pre-check OK: status=1, email={self.email}")
+
+    async def poll_otp(
+        self,
+        *,
+        recipient: str,
+        started_at: datetime,
+        timeout_seconds: float,
+        poll_interval_seconds: float,
+        log,
+    ) -> str:
+        deadline = time.monotonic() + max(timeout_seconds, 1.0)
+        log(f"[otp:smsbower] polling {self.email} (timeout {timeout_seconds:.0f}s)")
+        log(f"[otp:smsbower] api: {self.api_url}")
+
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+            attempt = 0
+            while True:
+                attempt += 1
+                try:
+                    response = await client.get(self.api_url)
+                    if response.status_code != 200:
+                        log(f"[otp:smsbower] HTTP {response.status_code} attempt {attempt}")
+                    else:
+                        data = response.json()
+
+                        # Ưu tiên check code trước (dù status bao nhiêu cũng lấy)
+                        code = str(data.get("code") or "").strip()
+                        if code and len(code) == 6 and code.isdigit():
+                            if _try_claim_otp(self.api_url, code):
+                                log(f"[otp:smsbower] found OTP {code} (attempt {attempt})")
+                                return code
+                            else:
+                                log(
+                                    f"[otp:smsbower] OTP {code} already claimed by another alias "
+                                    f"— searching all_codes... (attempt {attempt})"
+                                )
+
+                        # Fallback: check all_codes — tìm code chưa bị alias khác claim
+                        all_codes = data.get("all_codes")
+                        if isinstance(all_codes, list) and all_codes:
+                            candidate = _pick_unclaimed_otp(self.api_url, all_codes)
+                            if candidate:
+                                log(
+                                    f"[otp:smsbower] found unclaimed OTP from all_codes "
+                                    f"{candidate} (attempt {attempt})"
+                                )
+                                return candidate
+
+                        # Không có code nào còn trống → kiểm tra status terminal
+                        status = data.get("status")
+                        if status is not None and status != 1:
+                            log(f"[otp:smsbower] terminal status={status} attempt {attempt}")
+                            raise TimeoutError(
+                                f"SmsBower API terminal: status={status} for {self.email}"
+                            )
+
+                        if attempt <= 3 or attempt % 5 == 0:
+                            claimed_count = len(_CLAIMED_OTPS.get(self.api_url, set()))
+                            log(
+                                f"[otp:smsbower] waiting... "
+                                f"code=null claimed_pool={claimed_count} attempt {attempt}"
+                            )
+
+                except (httpx.HTTPError, ValueError) as exc:
+                    log(f"[otp:smsbower] error attempt {attempt}: {exc}")
+
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"OTP timeout after {timeout_seconds}s for {self.email} (smsbower)"
                     )
                 await asyncio.sleep(min(poll_interval_seconds, remaining))
 
@@ -777,3 +994,9 @@ def build_provider_gmail_advanced(
     *, email: str, api_url: str,
 ) -> GmailAdvancedProvider:
     return GmailAdvancedProvider(api_url=api_url, email=email)
+
+
+def build_provider_smsbower(
+    *, email: str, api_url: str,
+) -> SmsBowerProvider:
+    return SmsBowerProvider(api_url=api_url, email=email)

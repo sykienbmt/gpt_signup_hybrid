@@ -106,6 +106,10 @@
       input_help: 'Mỗi dòng: api_url hoặc email|api_url. Pre-check mail_status=live.',
       input_placeholder: 'https://checkotpgmail.live/otp/...\nbrandonspencer7424@gmail.com|https://checkotpgmail.live/otp/...',
     },
+    smsbower: {
+      input_help: 'Mỗi dòng: email----api_url (phân cách bằng 4 gạch ngang). Pre-check status=1.',
+      input_placeholder: 'gaylelauro9452100@gmail.com----smsbower.page/api/mail/getCodeBySignature?s=...',
+    },
   });
 
   function fmtDuration(secs) {
@@ -308,19 +312,25 @@
       const j = state.jobs.get(id);
       if (!j) continue;
 
+      // Secrets (password / secret_2fa) không nằm trong SSE snapshot mà fetch
+      // riêng qua /api/jobs/secrets → đọc từ secretsCache
+      const secrets = secretsCache.get(id) || {};
+      const pw = secrets.password || '';
+      const sec = secrets.secret || '';
+
       if (j.status === 'success') {
-        const base = `${j.email}|${j.password || ''}|${j.secret || ''}`;
+        const base = `${j.email}|${pw}|${sec}`;
         if (state.successTab === 'with-session') {
           if (j.session_data) {
             successLines.push(`${base}|${JSON.stringify(j.session_data)}`);
           }
           // jobs without session_data are omitted until fetched
         } else {
-          if (j.secret) successLines.push(base);
+          if (sec) successLines.push(base);
         }
       } else if (j.status === 'error') {
-        if (j.password) {
-          const base = `${j.email}|${j.password}|no_2fa`;
+        if (pw) {
+          const base = `${j.email}|${pw}|no_2fa`;
           if (state.successTab !== 'with-session') successLines.push(base);
         }
         errorLines.push(`${j.email}  →  ${j.error || 'unknown'}`);
@@ -329,7 +339,8 @@
 
     const successCount = state.order.filter((id) => {
       const j = state.jobs.get(id);
-      return j && j.status === 'success' && j.secret;
+      // has_secret là bool từ SSE snapshot; secret thật trong secretsCache
+      return j && j.status === 'success' && (j.has_secret || (secretsCache.get(id) || {}).secret);
     }).length;
     const withSessionCount = state.order.filter((id) => {
       const j = state.jobs.get(id);
@@ -476,7 +487,7 @@
         combos,
         default_password: dom.defaultPassword.value.trim() || null,
         mail_mode: state.currentMailMode,
-        gmail_alias_expand: state.currentMailMode === 'gmail_advanced' && dom.gmailAliasToggle.checked,
+        gmail_alias_expand: (state.currentMailMode === 'gmail_advanced' || state.currentMailMode === 'smsbower') && dom.gmailAliasToggle.checked,
         gmail_alias_count: parseInt(dom.gmailAliasCount.value, 10) || 1,
       };
       if (state.currentMailMode === 'worker') {
@@ -837,10 +848,10 @@
       dom.comboInput.placeholder = uiCopy.input_placeholder || spec.input_placeholder;
       dom.inputHint.textContent = uiCopy.input_help || spec.input_help;
     }
-    // Show Gmail alias toggle + count only for gmail_advanced mode
-    const isGmail = modeId === 'gmail_advanced';
-    dom.gmailAliasWrap.classList.toggle('hidden', !isGmail);
-    dom.gmailAliasCountWrap.classList.toggle('hidden', !isGmail);
+    // Show alias toggle + count for gmail_advanced and smsbower
+    const hasAlias = modeId === 'gmail_advanced' || modeId === 'smsbower';
+    dom.gmailAliasWrap.classList.toggle('hidden', !hasAlias);
+    dom.gmailAliasCountWrap.classList.toggle('hidden', !hasAlias);
     renderMailModeConfig(state.mailModes, modeId);
   }
 

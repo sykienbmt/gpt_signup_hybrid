@@ -14,6 +14,8 @@ from pydantic import BaseModel, Field
 from .auth import get_token  # legacy — token auth disabled
 from .manager import get_manager, get_session_manager, get_link_manager
 from .mail_modes import get_registry, serialize_for_api
+from .upi_automation import run_upi_automation
+from .check_account import check_accounts
 
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -758,6 +760,58 @@ async def link_events(request: Request) -> StreamingResponse:
     )
 
 
+@app.post("/api/link/jobs/{job_id}/upi-fill")
+async def upi_fill_job(job_id: str) -> JSONResponse:
+    """Mở browser, chọn UPI, điền billing info và click subscribe cho job India."""
+    lm = get_link_manager()
+    job = lm.jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    if job.status != "success" or not job.payment_link:
+        raise HTTPException(400, "job chưa có payment link")
+    if job.region != "IN":
+        raise HTTPException(400, "chỉ hỗ trợ UPI fill cho region IN (India)")
+
+    result = await run_upi_automation(
+        job.payment_link,
+        proxy=lm.proxy,
+        headless=True,
+        log=lambda msg: lm._job_log(job, msg),
+        job_id=job_id,
+        email=job.email,
+    )
+
+    # Attach screenshot URLs to the job & broadcast update
+    shots = result.get("screenshots") or []
+    urls = [f"/upi-shots/{Path(p).name}" for p in shots]
+    if urls:
+        job.screenshot_urls = list(dict.fromkeys((job.screenshot_urls or []) + urls))
+        lm._broadcast_job(job)
+    result["screenshot_urls"] = urls
+    return JSONResponse(result)
+
+
+class CheckAccountRequest(BaseModel):
+    lines: str = Field(default="")
+    max_concurrent: int = Field(default=5, ge=1, le=10)
+
+
+@app.post("/api/check/run")
+async def check_account_run(payload: CheckAccountRequest) -> JSONResponse:
+    """Check Plus status cho nhiều account: input email|pass|2fa|Session per line."""
+    lm = get_link_manager()
+    lines = [ln for ln in (payload.lines or "").splitlines() if ln.strip()]
+    if not lines:
+        return JSONResponse({"results": []})
+
+    results = await check_accounts(
+        lines,
+        proxy=lm.proxy,
+        max_concurrent=payload.max_concurrent,
+    )
+    return JSONResponse({"results": [r.to_dict() for r in results]})
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Static UI
 # ─────────────────────────────────────────────────────────────────────
@@ -773,3 +827,8 @@ async def index() -> HTMLResponse:
 # Mount static folder cho CSS/JS
 if _STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
+
+# Mount UPI screenshots
+_UPI_SCREENSHOT_DIR = Path(__file__).resolve().parent.parent / "runtime" / "upi_screenshots"
+_UPI_SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/upi-shots", StaticFiles(directory=_UPI_SCREENSHOT_DIR), name="upi_shots")

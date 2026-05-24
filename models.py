@@ -42,13 +42,18 @@ class SignupRequest(BaseModel):
     #   - Gmail Advanced (checkotpgmail.live API) — cho mail @gmail.com mua qua dịch vụ.
     mail_provider: str = Field(
         default="worker",
-        description="Provider: 'worker', 'outlook', hoặc 'gmail_advanced'.",
-        pattern="^(worker|outlook|gmail_advanced)$",
+        description="Provider: 'worker', 'outlook', 'gmail_advanced', hoặc 'smsbower'.",
+        pattern="^(worker|outlook|gmail_advanced|smsbower)$",
     )
     # Gmail Advanced config
     gmail_api_url: str | None = Field(
         default=None,
         description="API URL checkotpgmail.live (dùng khi mail_provider='gmail_advanced').",
+    )
+    # SmsBower config
+    smsbower_api_url: str | None = Field(
+        default=None,
+        description="API URL smsbower.page (dùng khi mail_provider='smsbower').",
     )
     # Worker config
     email_logs_url: str = Field(
@@ -74,6 +79,14 @@ class SignupRequest(BaseModel):
     # Polling chung
     otp_timeout_seconds: float = Field(default=180.0, ge=10, description="Thời gian tối đa đợi OTP về.")
     otp_poll_interval_seconds: float = Field(default=4.0, ge=0.5)
+    otp_initial_delay_seconds: float = Field(
+        default=0.0, ge=0,
+        description="Delay (giây) chờ trước khi bắt đầu poll OTP lần đầu. Dùng khi provider cần thời gian xử lý.",
+    )
+    otp_max_resends: int = Field(
+        default=3, ge=0,
+        description="Số lần tối đa click Resend nếu không nhận được OTP. 0 = không resend.",
+    )
 
     # Form readiness wait
     sentinel_cookie_timeout_seconds: float = Field(
