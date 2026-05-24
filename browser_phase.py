@@ -222,6 +222,7 @@ async def _wait_otp_form(page, *, timeout_seconds: float, log) -> str:
         'input[name="code"]',
         'input[autocomplete="one-time-code"]',
         'input[inputmode="numeric"]',
+        'input[id$="-code"]',  # new flow: dynamic ID ending with -code
     )
     for sel in selectors:
         try:
@@ -332,14 +333,28 @@ async def _detect_screen(page) -> str:
     # Nếu cả OTP input và password button cùng visible, password button thắng
     if "/email-verification" in cur or "/email-otp" in cur:
         try:
-            pwd_btn = page.locator('button:has-text("Continue with password"), a:has-text("Continue with password")').first
+            pwd_btn = page.locator(
+                'button:has-text("Continue with password"), a:has-text("Continue with password"), '
+                'a:has-text("mật khẩu"), button:has-text("mật khẩu")'
+            ).first
             if await pwd_btn.is_visible(timeout=300):
                 return "continue"
         except Exception:
             pass
+        # New flow: sau khi click "Continue with password", form password xuất hiện
+        # ngay trên cùng URL /email-verification (SPA) — detect password input
+        try:
+            pwd_input = page.locator('input[type="password"]').first
+            if await pwd_input.is_visible(timeout=200):
+                return "password_create"
+        except Exception:
+            pass
     # OTP form (URL có thể là /email-verification hoặc /email-otp)
     try:
-        otp_input = page.locator('input[name="code"], input[autocomplete="one-time-code"]').first
+        otp_input = page.locator(
+            'input[name="code"], input[autocomplete="one-time-code"], '
+            'input[inputmode="numeric"], input[id$="-code"]'
+        ).first
         if await otp_input.is_visible(timeout=200):
             return "otp"
     except Exception:
@@ -405,11 +420,41 @@ async def _drive_signup_flow(
             if register_attempted:
                 await asyncio.sleep(1.0)
                 continue
+            register_attempted = True
+
+            # Thử UI form fill trước (new flow: form nằm trên /email-verification)
+            ui_filled = False
+            try:
+                pwd_input = page.locator('input[type="password"]').first
+                if await pwd_input.is_visible(timeout=2000):
+                    await pwd_input.click(force=True, timeout=3000)
+                    await pwd_input.fill("")
+                    await pwd_input.type(request.password, delay=50)
+                    await asyncio.sleep(0.3)
+                    for btn_sel in (
+                        'button:has-text("Tiếp tục")',
+                        'button:has-text("Continue")',
+                        'button[type="submit"]',
+                    ):
+                        try:
+                            await page.click(btn_sel, timeout=2000)
+                            log(f"[flow] password submitted via UI form ({btn_sel})")
+                            ui_filled = True
+                            break
+                        except Exception:
+                            continue
+            except Exception as exc:
+                log(f"[flow] UI password fill error: {exc}")
+
+            if ui_filled:
+                await asyncio.sleep(1.5)
+                continue
+
+            # Fallback: API call (old flow /create-account/password)
             log(f"[flow] POST /api/accounts/user/register (email={request.email})")
             result = await page.evaluate(
                 _REGISTER_USER_JS, {"username": request.email, "password": request.password},
             )
-            register_attempted = True
             if not isinstance(result, dict):
                 raise BrowserPhaseError(f"register unexpected result: {result}")
             status = result.get("status")
@@ -484,14 +529,17 @@ async def _drive_signup_flow(
                         same_screen_count = 0
                         await asyncio.sleep(2.0)
                         continue
-                    # Không còn pending → resend
-                    log(f"[flow] OTP rejected: {err_text.strip()[:80]} — resend email & poll lại")
-                    try:
-                        resend_btn = page.locator('button:has-text("Resend"), a:has-text("Resend")').first
-                        await resend_btn.click(timeout=3000)
-                        log("[flow] clicked 'Resend email'")
-                    except Exception as exc:
-                        log(f"[flow] resend button not found: {exc}")
+                    # Không còn pending → resend (chỉ khi max_resends > 0)
+                    log(f"[flow] OTP rejected: {err_text.strip()[:80]} — poll tiếp code mới")
+                    if max_resends > 0:
+                        try:
+                            resend_btn = page.locator('button:has-text("Resend"), a:has-text("Resend")').first
+                            await resend_btn.click(timeout=3000)
+                            log("[flow] clicked 'Resend email'")
+                        except Exception as exc:
+                            log(f"[flow] resend button not found: {exc}")
+                    else:
+                        log("[flow] max_resends=0 — không click Resend, đợi OTP mới từ provider")
                     # Reset state để poll code mới
                     otp_submitted = False
                     same_screen_count = 0
@@ -544,9 +592,10 @@ async def _drive_signup_flow(
             # Nếu đợi >30s chưa có code mới → click Resend rồi poll tiếp.
             # iCloud có thể gửi mail mới trước, mail cũ delay → lấy nhiều codes
             # rồi thử lần lượt trước khi resend.
-            resend_after_seconds = 30.0
+            # max_resends=0: không split nhỏ, dùng full timeout để đợi OTP mới tự đến
+            max_resends = request.otp_max_resends
+            resend_after_seconds = 30.0 if max_resends > 0 else request.otp_timeout_seconds
             resend_count = 0
-            max_resends = request.otp_max_resends  # configurable per provider
             stale_poll_count = 0  # đếm lần poll liên tiếp chỉ nhận code cũ
             stale_poll_resend_threshold = 5  # sau 5 lần poll chỉ code cũ → resend
             while True:
@@ -820,7 +869,7 @@ async def _fill_about_you(page, *, name: str, birthdate: str, timeout_seconds: f
             log(f"[browser] filled birthday={birthdate}")
         else:
             age_input = None
-            for sel in ('input[name="age"]', 'input[type="number"]', 'input[inputmode="numeric"]'):
+            for sel in ('input[name="age"]', 'input[id$="-age"]', 'input[type="number"]', 'input[inputmode="numeric"]'):
                 try:
                     await page.wait_for_selector(sel, state="visible", timeout=1500)
                     age_input = sel
@@ -840,8 +889,14 @@ async def _fill_about_you(page, *, name: str, birthdate: str, timeout_seconds: f
 
         await asyncio.sleep(0.3)
 
-        # Submit
-        for btn in ('button[type="submit"]', 'button:has-text("Continue")', 'button:has-text("Agree")'):
+        # Submit — new flow dùng "Hoàn tất tạo tài khoản"
+        for btn in (
+            'button:has-text("Hoàn tất")',
+            'button:has-text("Finish")',
+            'button[type="submit"]',
+            'button:has-text("Continue")',
+            'button:has-text("Agree")',
+        ):
             try:
                 await page.click(btn, timeout=2000)
                 log(f"[browser] clicked {btn}")
@@ -884,7 +939,13 @@ async def _fill_about_you(page, *, name: str, birthdate: str, timeout_seconds: f
             if not submitted_again and time.monotonic() > retry_submit_at and "about-you" in cur:
                 submitted_again = True
                 log("[browser] still on /about-you after 10s — retrying submit")
-                for btn in ('button[type="submit"]', 'button:has-text("Continue")', 'button:has-text("Agree")'):
+                for btn in (
+                    'button:has-text("Hoàn tất")',
+                    'button:has-text("Finish")',
+                    'button[type="submit"]',
+                    'button:has-text("Continue")',
+                    'button:has-text("Agree")',
+                ):
                     try:
                         await page.click(btn, timeout=2000)
                         log(f"[browser] re-clicked {btn}")

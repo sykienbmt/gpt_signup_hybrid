@@ -259,10 +259,10 @@ def _build_smsbower_request(
         email=email,
         mail_provider="smsbower",
         smsbower_api_url=api_url,
-        otp_timeout_seconds=70.0,       # 7s delay + 30s poll + resend + 30s poll
+        otp_timeout_seconds=120.0,      # đủ 2 phút để đợi OTP thứ 2 (sau bước set password)
         otp_initial_delay_seconds=7.0,  # chờ 7s trước khi gọi API lần đầu
-        otp_max_resends=1,              # resend tối đa 1 lần, sau đó skip job
-        otp_poll_interval_seconds=3.0,
+        otp_max_resends=0,              # KHÔNG resend — đợi OTP thứ 2 tự đến
+        otp_poll_interval_seconds=5.0,
         headless=headless,
         keep_browser_open=keep_browser_open,
         password=password,

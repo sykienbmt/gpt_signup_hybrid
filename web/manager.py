@@ -688,6 +688,13 @@ class JobManager:
                 return
 
             log("[2fa] retry-only: dùng session đã có")
+            access_token = sdata.get("access_token")
+            if not access_token:
+                job.status = "error"
+                job.error = "session file thiếu access_token"
+                job.finished_at = time.time()
+                self._broadcast_job(job)
+                return
             try:
                 mfa_result = await enable_2fa(
                     access_token=access_token,
@@ -696,6 +703,8 @@ class JobManager:
                     log=log,
                 )
             except MfaError as exc:
+                if exc.partial_state:
+                    log(f"[2fa] partial_state (enroll OK, activate fail) secret_len={len(exc.partial_state.get('secret') or '')}")
                 job.status = "error"
                 job.error = f"2fa: {exc}"
                 job.finished_at = time.time()
@@ -801,7 +810,6 @@ class JobManager:
                 job.finished_at = time.time()
                 self._broadcast_job(job)
                 return
-
             try:
                 mfa_result = await enable_2fa(
                     access_token=result.access_token,
@@ -810,6 +818,8 @@ class JobManager:
                     log=log,
                 )
             except MfaError as exc:
+                if exc.partial_state:
+                    log(f"[2fa] partial_state (enroll OK, activate fail) secret_len={len(exc.partial_state.get('secret') or '')}")
                 job.status = "error"
                 job.error = f"2fa: {exc}"
                 job.finished_at = time.time()

@@ -1,22 +1,43 @@
-"""Enable 2FA (TOTP) cho account đã đăng ký.
+"""Enable 2FA (TOTP) cho account đã đăng ký — kiến trúc fail-safe.
 
 Flow theo HAR:
     1. POST /backend-api/accounts/mfa/enroll body {"factor_type":"totp"}
        → trả {secret, session_id, factor: {id, factor_type:"totp", ...}}
-    2. (Optional) POST /backend-api/accounts/mfa/user/activate_enrollment
+    2. POST /backend-api/accounts/mfa/user/activate_enrollment
        body {"factor_id":..., "session_id":..., "code":"<6-digit TOTP>"}
        → confirm enrollment, mfa_enabled=true.
 
 Secret base32 tương thích Google Authenticator. Lưu để gen code mỗi lần login.
+
+KIẾN TRÚC FAIL-SAFE
+-------------------
+Lỗi cũ: enroll OK → activate OK → mfa_info timeout → caller raise → MẤT secret
+       → retry-2fa enroll lại → server đã có active factor → fail vô hạn.
+
+Fix bằng 4 cơ chế:
+
+A. ``on_enroll`` callback: persist secret NGAY sau enroll OK (trước activate).
+   Activate fail/timeout sau đó vẫn không mất secret.
+
+B. ``pending_enrollment`` argument: caller có thể pass secret/factor_id/session_id
+   từ DB → bỏ qua enroll, đi thẳng activate. Idempotent với mọi retry.
+
+C. Idempotent activate: error chứa ``already`` / ``active`` / ``enabled``
+   → coi như success. Server-side đã enable rồi.
+
+D. ``MfaError.partial_state``: khi enroll xong nhưng activate fail, exception
+   mang theo state để caller persist + retry không cần enroll lại.
+
+E. ``mfa_info`` đổi thành verify nhẹ: 1 attempt × 10s timeout, mọi lỗi → ``{}``,
+   tuyệt đối không raise. Activate 200 đã đủ xác nhận 2FA bật.
 """
 from __future__ import annotations
 
 import asyncio
 import json
-import time
-from typing import Any
+from typing import Any, Awaitable, Callable
 
-from curl_cffi import requests as curl_requests
+from curl_cffi.requests import AsyncSession
 
 from .totp_helper import generate_code, normalize_secret
 
@@ -29,30 +50,49 @@ _HTTP_TIMEOUT = 60.0
 _MAX_ATTEMPTS = 4
 _BACKOFF_SECONDS = (3.0, 6.0, 10.0)  # delay sau attempt 1, 2, 3
 
+# mfa_info: optional verify — KHÔNG ảnh hưởng tới quyết định activated=True.
+_MFA_INFO_TIMEOUT = 10.0
+
+# Markers cho idempotent activate — server đã enable factor rồi
+_ACTIVATE_IDEMPOTENT_MARKERS = (
+    "already",
+    "active",
+    "enabled",
+    "duplicate",
+    "exists",
+)
+
+# Markers cho enroll khi server đã có active factor — ưu tiên dùng pending state
+_ENROLL_CONFLICT_MARKERS = (
+    "already",
+    "exists",
+    "active",
+    "enrolled",
+    "duplicate",
+)
+
+
+# Kiểu callback persist khi đã enroll xong (chưa activate)
+EnrollPersistCallback = Callable[[dict[str, Any]], Awaitable[None]]
+
 
 class MfaError(Exception):
-    """MFA enable fail."""
+    """MFA enable fail.
+
+    ``partial_state`` chứa ``{secret, factor_id, session_id}`` khi enroll đã
+    thành công nhưng activate fail — caller có thể persist + retry với
+    ``pending_enrollment`` mà không phải enroll lại.
+    """
+
+    def __init__(self, message: str, *, partial_state: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.partial_state = partial_state
 
 
-def _build_session(*, user_agent: str, impersonate: str = "firefox135", proxy: str | None = None):
-    session = curl_requests.Session(impersonate=impersonate)
-    if proxy:
-        session.proxies = {"http": proxy, "https": proxy}
-    session.headers.update({
-        "User-Agent": user_agent,
-        "Accept": "*/*",
-        "Accept-Language": "en-US,en;q=0.5",
-        "Origin": "https://chatgpt.com",
-        "Referer": "https://chatgpt.com/",
-    })
-    return session
-
-
-def _refresh_access_token(
-    session, *, cookies: list[dict[str, Any]], log,
+async def _refresh_access_token(
+    session: AsyncSession, *, cookies: list[dict[str, Any]], log,
 ) -> str | None:
     """Gọi /api/auth/session với session cookies để lấy access_token mới."""
-    # Inject cookies chatgpt.com vào session
     for c in cookies:
         domain = (c.get("domain") or "").lower()
         if "chatgpt.com" in domain:
@@ -63,7 +103,7 @@ def _refresh_access_token(
             )
     url = "https://chatgpt.com/api/auth/session"
     try:
-        r = session.get(url, timeout=30)
+        r = await session.get(url, timeout=30)
         if r.status_code != 200:
             log(f"[mfa] refresh token: HTTP {r.status_code}")
             return None
@@ -79,14 +119,14 @@ def _refresh_access_token(
         return None
 
 
-def _post_with_retry(
-    session, *, url: str, headers: dict, body: dict, log, label: str,
+async def _post_with_retry(
+    session: AsyncSession, *, url: str, headers: dict, body: dict, log, label: str,
 ):
     """POST với retry exponential backoff khi timeout/5xx/connection error."""
     last_exc: Exception | None = None
     for attempt in range(1, _MAX_ATTEMPTS + 1):
         try:
-            r = session.post(
+            r = await session.post(
                 url, headers=headers, data=json.dumps(body), timeout=_HTTP_TIMEOUT,
             )
             if r.status_code in (502, 503, 504):
@@ -101,12 +141,14 @@ def _post_with_retry(
         if attempt < _MAX_ATTEMPTS:
             backoff = _BACKOFF_SECONDS[min(attempt - 1, len(_BACKOFF_SECONDS) - 1)]
             log(f"[mfa] retry in {backoff:.0f}s...")
-            time.sleep(backoff)
+            await asyncio.sleep(backoff)
 
     raise MfaError(f"{label} failed sau {_MAX_ATTEMPTS} attempts: {last_exc}")
 
 
-def _enroll_totp(session, *, access_token: str, cookies: list[dict[str, Any]] | None, log) -> tuple[dict[str, Any], str]:
+async def _enroll_totp(
+    session: AsyncSession, *, access_token: str, cookies: list[dict[str, Any]] | None, log,
+) -> tuple[dict[str, Any], str]:
     """POST /mfa/enroll → trả (enroll_data, access_token_used).
 
     Nếu 401 token_revoked + có cookies → refresh access_token rồi retry.
@@ -117,7 +159,7 @@ def _enroll_totp(session, *, access_token: str, cookies: list[dict[str, Any]] | 
         "Content-Type": "application/json",
     }
     log("[mfa] POST mfa/enroll factor_type=totp")
-    r = _post_with_retry(
+    r = await _post_with_retry(
         session, url=url, headers=headers, body={"factor_type": "totp"},
         log=log, label="enroll",
     )
@@ -126,12 +168,12 @@ def _enroll_totp(session, *, access_token: str, cookies: list[dict[str, Any]] | 
         body_text = r.text[:500]
         if "token_revoked" in body_text or "invalidated" in body_text:
             log("[mfa] token revoked — refreshing access_token...")
-            new_token = _refresh_access_token(session, cookies=cookies, log=log)
+            new_token = await _refresh_access_token(session, cookies=cookies, log=log)
             if new_token:
                 access_token = new_token
                 headers["Authorization"] = f"Bearer {access_token}"
-                time.sleep(2.0)  # small delay cho server propagate
-                r = _post_with_retry(
+                await asyncio.sleep(2.0)  # small delay cho server propagate
+                r = await _post_with_retry(
                     session, url=url, headers=headers, body={"factor_type": "totp"},
                     log=log, label="enroll-retry",
                 )
@@ -147,47 +189,103 @@ def _enroll_totp(session, *, access_token: str, cookies: list[dict[str, Any]] | 
     return data, access_token
 
 
-def _activate_enrollment(
-    session,
+def _is_activate_idempotent_response(status_code: int, body_text: str) -> bool:
+    """True nếu activate response cho biết factor đã ở trạng thái active.
+
+    Cases:
+      - HTTP 200 mà body chứa "already" / "active" → idempotent OK.
+      - HTTP 4xx (400/409/422) mà body chứa marker idempotent → coi như đã active.
+    """
+    text_lower = (body_text or "").lower()
+    has_marker = any(m in text_lower for m in _ACTIVATE_IDEMPOTENT_MARKERS)
+    if not has_marker:
+        return False
+    # Chỉ nhận idempotent với status có ý nghĩa (200 OK hoặc 4xx conflict).
+    # 5xx + marker = noise, không tin được.
+    return status_code == 200 or 400 <= status_code < 500
+
+
+async def _activate_enrollment(
+    session: AsyncSession,
     *,
     access_token: str,
     factor_id: str,
     session_id: str,
     code: str,
+    extra_headers: dict[str, str] | None = None,
     log,
-) -> dict[str, Any]:
-    """POST /mfa/user/activate_enrollment để confirm 6-digit TOTP."""
+) -> tuple[dict[str, Any], bool]:
+    """POST /mfa/user/activate_enrollment để confirm 6-digit TOTP.
+
+    Body KHÔNG có factor_id (theo HAR thực tế).
+    Returns: (response_body, idempotent_flag).
+        idempotent_flag=True khi server cho biết factor đã active (skip activate
+        nhưng coi như success).
+    """
     url = f"{_BASE}/accounts/mfa/user/activate_enrollment"
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json",
+        "x-openai-target-path": "/backend-api/accounts/mfa/user/activate_enrollment",
+        "x-openai-target-route": "/backend-api/accounts/mfa/user/activate_enrollment",
     }
+    if extra_headers:
+        headers.update(extra_headers)
+    # Body theo HAR: KHÔNG có factor_id
     body = {
-        "factor_id": factor_id,
+        "code": code,
         "factor_type": "totp",
         "session_id": session_id,
-        "code": code,
     }
-    log(f"[mfa] POST activate_enrollment factor_id={factor_id[:20]} code={code}")
-    r = _post_with_retry(
+    log(f"[mfa] POST activate_enrollment session_id={session_id[:20]} code={code}")
+    log(f"[mfa] activate request body: {json.dumps(body)}")
+    log(f"[mfa] activate request headers (non-auth): { {k:v for k,v in headers.items() if k.lower() != 'authorization'} }")
+    r = await _post_with_retry(
         session, url=url, headers=headers, body=body, log=log, label="activate",
     )
-    if r.status_code != 200:
-        raise MfaError(f"activate failed HTTP {r.status_code}: {r.text[:300]}")
-    data = r.json()
-    log(f"[mfa] activate OK")
-    return data
+    body_text = r.text[:1000] if hasattr(r, "text") else ""
+    log(f"[mfa] activate response HTTP {r.status_code}: {body_text}")
+
+    if r.status_code == 200:
+        try:
+            data = r.json()
+        except Exception:
+            data = {}
+        log("[mfa] activate OK")
+        return data, False
+
+    # Idempotent: factor đã active từ trước (vd: retry sau activate đã OK ngầm)
+    if _is_activate_idempotent_response(r.status_code, body_text):
+        log(f"[mfa] activate HTTP {r.status_code} idempotent — factor đã active: {body_text[:120]}")
+        return {}, True
+
+    raise MfaError(
+        f"activate failed HTTP {r.status_code}: {body_text[:300]}",
+        partial_state={
+            "secret": None,  # secret được fill bởi caller (đã có sẵn)
+            "factor_id": factor_id,
+            "session_id": session_id,
+        },
+    )
 
 
-def _check_mfa_info(session, *, access_token: str, log) -> dict[str, Any]:
-    """GET /mfa_info để verify trạng thái sau khi activate."""
+async def _check_mfa_info(session: AsyncSession, *, access_token: str, log) -> dict[str, Any]:
+    """GET /mfa_info — verify-only, fire-and-forget.
+
+    Activate 200 = đã enable server-side. mfa_info chỉ để log info bổ sung.
+    1 attempt × 10s timeout. Mọi exception/non-200 → ``{}``, không raise.
+    """
     url = f"{_BASE}/accounts/mfa_info"
     headers = {"Authorization": f"Bearer {access_token}"}
-    r = session.get(url, headers=headers, timeout=30)
-    if r.status_code != 200:
-        log(f"[mfa] WARN mfa_info HTTP {r.status_code}")
+    try:
+        r = await session.get(url, headers=headers, timeout=_MFA_INFO_TIMEOUT)
+        if r.status_code != 200:
+            log(f"[mfa] mfa_info HTTP {r.status_code} — ignored (activate đã OK)")
+            return {}
+        return r.json()
+    except Exception as exc:
+        log(f"[mfa] mfa_info skipped ({type(exc).__name__}: {exc}) — activate đã OK")
         return {}
-    return r.json()
 
 
 async def enable_2fa(
@@ -198,6 +296,8 @@ async def enable_2fa(
     impersonate: str = "firefox135",
     proxy: str | None = None,
     activate: bool = True,
+    pending_enrollment: dict[str, Any] | None = None,
+    on_enroll: EnrollPersistCallback | None = None,
     log=print,
 ) -> dict[str, Any]:
     """Enable 2FA TOTP cho account hiện tại.
@@ -209,6 +309,13 @@ async def enable_2fa(
         proxy: HTTP/HTTPS proxy.
         activate: True = gọi activate_enrollment với code TOTP đầu tiên (bật 2FA luôn).
                   False = chỉ enroll, lưu secret để mày confirm sau.
+        pending_enrollment: Dict ``{secret, factor_id, session_id}`` từ lần enroll
+            trước (đã persist). Nếu có → BỎ QUA enroll, đi thẳng activate.
+            Tránh enroll loop khi server đã có active factor.
+        on_enroll: Async callback nhận ``{secret, factor_id, session_id, status}``
+            sau khi enroll OK (TRƯỚC activate). Caller persist vào DB tại đây để
+            activate fail không mất secret. Best-effort: callback raise → log
+            warning nhưng vẫn tiếp tục activate.
         log: callable.
 
     Returns:
@@ -221,45 +328,146 @@ async def enable_2fa(
             "activated": True / False,
             "mfa_info": {...}  # nếu activate=True, response /mfa_info sau khi enable
         }
+
+    Raises:
+        MfaError: Nếu enroll/activate fail. ``partial_state`` (nếu có) chứa
+            secret/factor_id/session_id để caller persist + retry sau.
     """
-    def _sync() -> dict[str, Any]:
-        session = _build_session(user_agent=user_agent, impersonate=impersonate, proxy=proxy)
-        try:
-            enroll, active_token = _enroll_totp(
-                session, access_token=access_token, cookies=cookies, log=log,
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+
+    # Extract Sentinel + device headers từ cookies
+    oai_is_token: str | None = None
+    oai_device_id: str | None = None
+    if cookies:
+        for c in cookies:
+            name = c.get("name", "")
+            val = c.get("value", "")
+            if name == "__Secure-oai-is" and val:
+                oai_is_token = val
+            elif name == "oai-did" and val:
+                oai_device_id = val
+
+    base_headers: dict[str, str] = {
+        "User-Agent": user_agent,
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Origin": "https://chatgpt.com",
+        "Referer": "https://chatgpt.com/",
+        "oai-client-build-number": "6844271",
+        "oai-client-version": "prod-8117aba90ffac2b43c6118f2fc2eefaac58f816d",
+        "oai-language": "en-US",
+    }
+    if oai_is_token:
+        base_headers["x-oai-is"] = oai_is_token
+    if oai_device_id:
+        base_headers["oai-device-id"] = oai_device_id
+
+    async with AsyncSession(impersonate=impersonate, proxies=proxies, headers=base_headers) as session:
+        # Inject chatgpt.com cookies vào session
+        if cookies:
+            for c in cookies:
+                domain = (c.get("domain") or "").lower()
+                if "chatgpt.com" in domain or "openai.com" in domain:
+                    session.cookies.set(
+                        c["name"], c["value"],
+                        domain=c.get("domain") or "chatgpt.com",
+                        path=c.get("path") or "/",
+                    )
+        # ── Phase 1: secure secret ──
+        # Ưu tiên pending_enrollment từ caller (DB) → bỏ qua enroll.
+        # Nếu enroll lần này conflict (server đã có active factor) → đẩy lỗi
+        # để caller phát hiện account đã 2FA enabled từ trước.
+        active_token = access_token
+        if pending_enrollment and pending_enrollment.get("secret"):
+            secret = normalize_secret(pending_enrollment["secret"])
+            factor_id = pending_enrollment["factor_id"]
+            enroll_session_id = pending_enrollment["session_id"]
+            log(
+                f"[mfa] reuse pending enrollment factor_id={factor_id[:20]} "
+                f"secret_len={len(secret)} (skip enroll)"
             )
+        else:
+            try:
+                enroll, active_token = await _enroll_totp(
+                    session, access_token=access_token, cookies=cookies, log=log,
+                )
+            except MfaError as exc:
+                # Detect enroll conflict — server đã có active factor.
+                # Không có pending để fallback → fail-fast, caller phải dùng
+                # luồng "Get Session" với secret đã biết.
+                msg = str(exc).lower()
+                if any(m in msg for m in _ENROLL_CONFLICT_MARKERS):
+                    raise MfaError(
+                        f"enroll conflict — account đã có 2FA active server-side. "
+                        f"Caller phải dùng pending_enrollment (DB) hoặc Get Session "
+                        f"flow với secret cũ. Original: {exc}"
+                    ) from exc
+                raise
+
             secret = normalize_secret(enroll["secret"])
             factor_id = enroll["factor"]["id"]
-            session_id = enroll["session_id"]
-            first_code = generate_code(secret)
+            enroll_session_id = enroll["session_id"]
 
-            result: dict[str, Any] = {
-                "secret": secret,
-                "factor_id": factor_id,
-                "session_id": session_id,
-                "provisioning_uri": f"otpauth://totp/ChatGPT?secret={secret}&issuer=ChatGPT",
-                "first_code": first_code,
-                "activated": False,
-                "mfa_info": None,
-            }
+            # ── Persist NGAY (callback) — activate fail vẫn không mất secret ──
+            if on_enroll is not None:
+                try:
+                    await on_enroll({
+                        "secret": secret,
+                        "factor_id": factor_id,
+                        "session_id": enroll_session_id,
+                        "status": "enrolled",
+                    })
+                except Exception as exc_persist:
+                    # Best-effort: log warning, vẫn tiếp tục activate.
+                    # Caller nên đảm bảo on_enroll an toàn (write atomic).
+                    log(f"[mfa] WARN on_enroll callback raised: {exc_persist}")
 
-            if activate:
-                _activate_enrollment(
-                    session,
-                    access_token=active_token,
-                    factor_id=factor_id,
-                    session_id=session_id,
-                    code=first_code,
-                    log=log,
-                )
-                result["activated"] = True
-                result["mfa_info"] = _check_mfa_info(session, access_token=active_token, log=log)
+        first_code = generate_code(secret)
+        result: dict[str, Any] = {
+            "secret": secret,
+            "factor_id": factor_id,
+            "session_id": enroll_session_id,
+            "provisioning_uri": f"otpauth://totp/ChatGPT?secret={secret}&issuer=ChatGPT",
+            "first_code": first_code,
+            "activated": False,
+            "mfa_info": None,
+        }
 
+        if not activate:
             return result
-        finally:
-            try:
-                session.close()
-            except Exception:
-                pass
 
-    return await asyncio.to_thread(_sync)
+        # ── Phase 2: activate ──
+        activate_extra: dict[str, str] = {}
+        if oai_is_token:
+            activate_extra["x-oai-is"] = oai_is_token
+        if oai_device_id:
+            activate_extra["oai-device-id"] = oai_device_id
+        try:
+            _data, idempotent = await _activate_enrollment(
+                session,
+                access_token=active_token,
+                factor_id=factor_id,
+                session_id=enroll_session_id,
+                code=first_code,
+                extra_headers=activate_extra or None,
+                log=log,
+            )
+        except MfaError as exc:
+            # Bổ sung secret vào partial_state để caller persist đầy đủ
+            if exc.partial_state is not None:
+                exc.partial_state["secret"] = secret
+            else:
+                exc.partial_state = {
+                    "secret": secret,
+                    "factor_id": factor_id,
+                    "session_id": enroll_session_id,
+                }
+            raise
+
+        result["activated"] = True
+        if idempotent:
+            log("[mfa] activate idempotent — factor đã active từ trước, skip mfa_info")
+            result["mfa_info"] = {}
+        else:
+            result["mfa_info"] = await _check_mfa_info(session, access_token=active_token, log=log)
+        return result
