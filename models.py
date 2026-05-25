@@ -55,6 +55,13 @@ class SignupRequest(BaseModel):
         default=None,
         description="API URL smsbower.page (dùng khi mail_provider='smsbower').",
     )
+    smsbower_max_all_codes: int = Field(
+        default=0, ge=0,
+        description=(
+            "[smsbower] Nếu > 0: raise ngay khi len(all_codes) >= giá trị này "
+            "và tất cả codes đều đã claimed — dùng cho recheck job (max=2)."
+        ),
+    )
     # Worker config
     email_logs_url: str = Field(
         default="https://icloud-cf-mail.n5pskgzs9g.workers.dev/logs",
@@ -86,6 +93,13 @@ class SignupRequest(BaseModel):
     otp_max_resends: int = Field(
         default=3, ge=0,
         description="Số lần tối đa click Resend nếu không nhận được OTP. 0 = không resend.",
+    )
+    otp_resend_on_reject: bool = Field(
+        default=True,
+        description=(
+            "Khi OTP bị reject (incorrect/expired): True = click Resend (mặc định), "
+            "False = không click Resend, chỉ chờ code mới tự gửi về (dùng cho SmsBower)."
+        ),
     )
 
     # Form readiness wait

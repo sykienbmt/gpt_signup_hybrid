@@ -307,6 +307,7 @@ async def _detect_screen(page) -> str:
       - 'password_create' : /create-account/password (form set password mới)
       - 'password_login'  : /log-in/password (form login với account đã tồn tại)
       - 'continue'        : /email-verification trang chọn 'Continue with password'
+      - 'passkey_enroll'  : create-account-enroll-passkey (bỏ qua)
       - 'auth_error'      : page lỗi /auth/error
       - 'unknown'         : không nhận diện được
     """
@@ -324,6 +325,8 @@ async def _detect_screen(page) -> str:
             return "about_you"
     except Exception:
         pass
+    if "create-account-enroll-passkey" in cur or "/create-account/enroll-passkey" in cur:
+        return "passkey_enroll"
     if "/create-account/password" in cur:
         return "password_create"
     if "/log-in/password" in cur:
@@ -484,18 +487,31 @@ async def _drive_signup_flow(
                         same_screen_count = 0
                         await asyncio.sleep(2.0)
                         continue
-                    # Không còn pending → resend
-                    log(f"[flow] OTP rejected: {err_text.strip()[:80]} — resend email & poll lại")
-                    try:
-                        resend_btn = page.locator('button:has-text("Resend"), a:has-text("Resend")').first
-                        await resend_btn.click(timeout=3000)
-                        log("[flow] clicked 'Resend email'")
-                    except Exception as exc:
-                        log(f"[flow] resend button not found: {exc}")
-                    # Reset state để poll code mới
-                    otp_submitted = False
-                    same_screen_count = 0
-                    await asyncio.sleep(2.0)
+                    if not request.otp_resend_on_reject:
+                        # SmsBower / provider không dùng Resend:
+                        # chờ code thứ 2 tự gửi về, không click Resend.
+                        # tried_codes + claim registry đã loại code cũ ra → poll tiếp
+                        # sẽ chờ cho đến khi code mới xuất hiện trong all_codes.
+                        log(
+                            f"[flow] OTP rejected: {err_text.strip()[:80]} "
+                            f"— không resend, chờ code lần 2 (~30-60s)..."
+                        )
+                        otp_submitted = False
+                        same_screen_count = 0
+                        await asyncio.sleep(2.0)
+                    else:
+                        # Không còn pending → click Resend (hành vi mặc định)
+                        log(f"[flow] OTP rejected: {err_text.strip()[:80]} — resend email & poll lại")
+                        try:
+                            resend_btn = page.locator('button:has-text("Resend"), a:has-text("Resend")').first
+                            await resend_btn.click(timeout=3000)
+                            log("[flow] clicked 'Resend email'")
+                        except Exception as exc:
+                            log(f"[flow] resend button not found: {exc}")
+                        # Reset state để poll code mới
+                        otp_submitted = False
+                        same_screen_count = 0
+                        await asyncio.sleep(2.0)
             except Exception:
                 pass
 
@@ -650,6 +666,32 @@ async def _drive_signup_flow(
             # Sau /about-you có thể vẫn còn step (rare), tiếp tục loop để chờ chatgpt.com
             await _wait_chatgpt_session(ctx, page, timeout_seconds=60.0, log=log)
             return callback_url, otp_seconds_total
+
+        if screen == "passkey_enroll":
+            # OpenAI hỏi đăng ký passkey — bỏ qua bằng cách click "Skip" hoặc navigate thẳng
+            log("[flow] passkey enrollment screen — skipping")
+            skipped = False
+            for skip_sel in (
+                'button:has-text("Skip")',
+                'button:has-text("Not now")',
+                'button:has-text("Maybe later")',
+                'a:has-text("Skip")',
+            ):
+                try:
+                    btn = page.locator(skip_sel).first
+                    if await btn.is_visible(timeout=1000):
+                        await btn.click(timeout=3000)
+                        log(f"[flow] clicked skip passkey: {skip_sel!r}")
+                        skipped = True
+                        break
+                except Exception:
+                    continue
+            if not skipped:
+                # Không tìm thấy nút skip → navigate thẳng sang chatgpt.com
+                log("[flow] no skip button found on passkey screen — navigating to chatgpt.com")
+                await page.goto("https://chatgpt.com/", wait_until="domcontentloaded")
+            await asyncio.sleep(1.5)
+            continue
 
         # screen == 'unknown' → đợi page settle
         await asyncio.sleep(0.7)

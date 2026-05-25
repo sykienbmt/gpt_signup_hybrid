@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 from pathlib import Path
 from typing import Any
 
@@ -160,6 +161,101 @@ async def retry_job(job_id: str) -> JSONResponse:
     return JSONResponse({"ok": True})
 
 
+class RecheckBody(BaseModel):
+    combos: str
+
+
+@app.post("/api/smsbower/recheck")
+async def smsbower_recheck(body: RecheckBody) -> JSONResponse:
+    """Check api_url từ combos input, queue alias mới cho những url còn OTP capacity.
+
+    Logic:
+    - Parse combos input (email----api_url per line)
+    - Deduplicate theo api_url, gọi API check all_codes
+    - Nếu len(all_codes) >= 2 → skip (inbox đã full)
+    - Nếu len(all_codes) < 2 → tạo dot-alias email, queue job mới với smsbower_max_all_codes=2
+    """
+    import httpx as _httpx
+
+    manager = get_manager()
+
+    # Parse combos từ input — mỗi dòng là email----api_url
+    url_to_email: dict[str, str] = {}
+    for line in body.combos.splitlines():
+        raw = line.strip()
+        if not raw or "----" not in raw:
+            continue
+        parts = raw.split("----", 1)
+        email = parts[0].strip()
+        url = parts[1].strip()
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+        if url not in url_to_email:
+            url_to_email[url] = email
+
+    if not url_to_email:
+        return JSONResponse({"requeued": 0, "skipped": 0, "message": "No valid SmsBower combos in input"})
+
+    # Check từng api_url concurrently
+    async def _check(url: str, email: str) -> tuple[str, str, int | None, str | None]:
+        try:
+            async with _httpx.AsyncClient(timeout=10.0, follow_redirects=True) as c:
+                r = await c.get(url)
+            if r.status_code != 200:
+                return url, email, None, f"HTTP {r.status_code}"
+            data = r.json()
+            codes = data.get("all_codes") or []
+            return url, email, len(codes), None
+        except Exception as exc:
+            return url, email, None, str(exc)[:120]
+
+    results = await asyncio.gather(*[_check(u, e) for u, e in url_to_email.items()])
+
+    requeued: list[dict] = []
+    skipped:  list[dict] = []
+
+    combos_to_add: list[str] = []
+    extra_fields_map: dict[str, dict] = {}  # combo → extra_req_fields
+
+    for url, email, codes_count, err in results:
+        if err:
+            skipped.append({"email": email, "reason": err})
+            continue
+        if codes_count is None or codes_count >= 2:
+            skipped.append({"email": email, "reason": f"all_codes={codes_count} — inbox full"})
+            continue
+
+        # Còn capacity → thêm 1 dấu chấm ở vị trí random trong local part
+        base_local = email.split("+")[0].split("@")[0]
+        domain = email.split("@", 1)[1]
+        if len(base_local) >= 2:
+            pos = random.randint(1, len(base_local) - 1)
+            dot_local = base_local[:pos] + "." + base_local[pos:]
+        else:
+            dot_local = base_local + ".x"
+        alias_email = f"{dot_local}@{domain}"
+        combo = f"{alias_email}----{url}"
+        combos_to_add.append(combo)
+        extra_fields_map[combo] = {"smsbower_max_all_codes": 2}
+        requeued.append({"email": alias_email, "original": email, "codes_used": codes_count})
+
+    # Queue jobs mới
+    if combos_to_add:
+        added = manager.add_jobs(combos_to_add, mail_mode="smsbower")
+        # Gán extra_req_fields cho từng job vừa tạo
+        for job in added:
+            extra = extra_fields_map.get(job.combo)
+            if extra:
+                job._extra_req_fields = extra  # type: ignore[attr-defined]
+
+    return JSONResponse({
+        "requeued": len(requeued),
+        "skipped": len(skipped),
+        "details": requeued,
+        "skipped_details": skipped,
+    })
+
+
 @app.delete("/api/jobs/{job_id}")
 async def delete_job(job_id: str) -> JSONResponse:
     manager = get_manager()
@@ -193,6 +289,14 @@ async def clear_finished_jobs() -> JSONResponse:
     """Xoá tất cả jobs đã xong khỏi memory (giải phóng RAM)."""
     manager = get_manager()
     removed = manager.clear_finished()
+    return JSONResponse({"removed": removed})
+
+
+@app.post("/api/jobs/clear-all")
+async def clear_all_jobs() -> JSONResponse:
+    """Cancel running/queued và xoá toàn bộ jobs khỏi memory."""
+    manager = get_manager()
+    removed = manager.clear_all()
     return JSONResponse({"removed": removed})
 
 
@@ -507,6 +611,13 @@ async def clear_finished_session_jobs() -> JSONResponse:
     return JSONResponse({"removed": removed})
 
 
+@app.post("/api/session/jobs/clear-all")
+async def clear_all_session_jobs() -> JSONResponse:
+    sm = get_session_manager()
+    removed = sm.clear_all()
+    return JSONResponse({"removed": removed})
+
+
 @app.get("/api/session/config")
 async def get_session_config() -> JSONResponse:
     sm = get_session_manager()
@@ -683,6 +794,13 @@ async def stop_all_link_jobs() -> JSONResponse:
 async def clear_finished_link_jobs() -> JSONResponse:
     lm = get_link_manager()
     removed = lm.clear_finished()
+    return JSONResponse({"removed": removed})
+
+
+@app.post("/api/link/jobs/clear-all")
+async def clear_all_link_jobs() -> JSONResponse:
+    lm = get_link_manager()
+    removed = lm.clear_all()
     return JSONResponse({"removed": removed})
 
 

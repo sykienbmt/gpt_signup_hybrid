@@ -36,6 +36,7 @@
     btnStopAll: $('link-btn-stop-all'),
     btnClearInput: $('link-btn-clear-input'),
     btnClearDone: $('link-btn-clear-done'),
+    btnClearAll: $('link-btn-clear-all'),
     btnCopyError: $('link-btn-copy-error'),
     comboCount: $('link-combo-count'),
     jobTimeout: $('link-job-timeout'),
@@ -143,7 +144,7 @@
       if (job.payment_link) {
         actions.push(
           `<button class="icon-btn" data-action="copy-link" data-id="${escHtml(id)}" title="Copy payment link">${window.GptUi.icon('link')}</button>`,
-          `<button class="icon-btn" data-action="show-qr" data-id="${escHtml(id)}" title="Show QR code">▣</button>`,
+          `<a class="icon-btn" href="${escHtml(job.payment_link)}" target="_blank" rel="noopener noreferrer" title="Open payment link">🔗</a>`,
         );
         if (job.region === 'IN') {
           const upiBusy = state.upiInProgress.has(id);
@@ -308,7 +309,7 @@
         }
       } else if (action === 'show-qr') {
         const job = state.jobs.get(id);
-        if (job && job.payment_link) showQrModal(job.payment_link);
+        if (job && job.payment_link) showQrModal(job.payment_link, job.email);
       } else if (action === 'show-shot') {
         event.preventDefault();
         const url = actionBtn.dataset.url;
@@ -377,6 +378,11 @@
     api('/api/link/jobs/clear-finished', { method: 'POST' }).catch((err) => alert(err.message));
   });
 
+  dom.btnClearAll.addEventListener('click', () => {
+    if (!confirm('Cancel ALL running jobs and remove the entire list?')) return;
+    api('/api/link/jobs/clear-all', { method: 'POST' }).catch((err) => alert(err.message));
+  });
+
   dom.btnCopyError.addEventListener('click', () => {
     window.GptUi.copyText(dom.errorPane.textContent);
   });
@@ -406,11 +412,12 @@
   const qrModal = document.getElementById('qr-modal');
   const qrCanvasWrap = document.getElementById('qr-canvas-wrap');
   const qrModalUrl = document.getElementById('qr-modal-url');
+  const qrModalEmail = document.getElementById('qr-modal-email');
   const qrModalClose = document.getElementById('qr-modal-close');
   const qrModalBackdrop = qrModal.querySelector('.qr-modal-backdrop');
   let _qrInstance = null;
 
-  function showQrModal(url) {
+  function showQrModal(url, email) {
     qrCanvasWrap.innerHTML = '';
     _qrInstance = new QRCode(qrCanvasWrap, {
       text: url,
@@ -420,6 +427,8 @@
       colorLight: '#ffffff',
       correctLevel: QRCode.CorrectLevel.M,
     });
+    qrModalEmail.textContent = email || '';
+    qrModalEmail.style.display = email ? '' : 'none';
     qrModalUrl.textContent = url;
     qrModal.classList.remove('hidden');
   }

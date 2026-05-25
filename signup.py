@@ -49,6 +49,7 @@ def _build_mail_provider(request: SignupRequest, *, settings) -> MailProvider:
         return build_provider_smsbower(
             email=request.email,
             api_url=request.smsbower_api_url,
+            max_all_codes=request.smsbower_max_all_codes,
         )
     if request.mail_provider == "worker":
         return build_provider_worker(

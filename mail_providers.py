@@ -832,7 +832,7 @@ class SmsBowerProvider:
 
     SEPARATOR = "----"
 
-    def __init__(self, *, api_url: str, email: str):
+    def __init__(self, *, api_url: str, email: str, max_all_codes: int = 0):
         if not api_url:
             raise ValueError("SmsBower api_url is required")
         if not email:
@@ -842,6 +842,7 @@ class SmsBowerProvider:
             api_url = "https://" + api_url
         self.api_url = api_url
         self.email = email
+        self.max_all_codes = max_all_codes  # 0 = disabled; 2 = skip khi inbox đã đủ 2 codes
 
     @classmethod
     def parse_line(cls, line: str) -> tuple[str, str]:
@@ -895,6 +896,13 @@ class SmsBowerProvider:
             raise ValueError(
                 f"SmsBower pre-check failed: status={status} (cần 1) — "
                 f"email={self.email}, dừng job."
+            )
+
+        all_codes = data.get("all_codes")
+        if isinstance(all_codes, list) and len(all_codes) >= 2:
+            raise ValueError(
+                f"SmsBower pre-check: inbox đã có {len(all_codes)} codes "
+                f"(>=2) — skip {self.email}."
             )
 
         log(f"[otp:smsbower] pre-check OK: status=1, email={self.email}")
@@ -954,6 +962,18 @@ class SmsBowerProvider:
                                 f"SmsBower API terminal: status={status} for {self.email}"
                             )
 
+                        # Recheck job: nếu all_codes đã đủ limit và tất cả đã claimed
+                        # → inbox không còn OTP nào có thể về nữa → bỏ ngay
+                        if (
+                            self.max_all_codes > 0
+                            and isinstance(all_codes, list)
+                            and len(all_codes) >= self.max_all_codes
+                        ):
+                            raise TimeoutError(
+                                f"SmsBower: inbox đã có {len(all_codes)}/{self.max_all_codes} codes, "
+                                f"tất cả đã used — skip job"
+                            )
+
                         if attempt <= 3 or attempt % 5 == 0:
                             claimed_count = len(_CLAIMED_OTPS.get(self.api_url, set()))
                             log(
@@ -997,6 +1017,6 @@ def build_provider_gmail_advanced(
 
 
 def build_provider_smsbower(
-    *, email: str, api_url: str,
+    *, email: str, api_url: str, max_all_codes: int = 0,
 ) -> SmsBowerProvider:
-    return SmsBowerProvider(api_url=api_url, email=email)
+    return SmsBowerProvider(api_url=api_url, email=email, max_all_codes=max_all_codes)

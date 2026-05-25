@@ -74,6 +74,9 @@
     gmailAliasWrap:       $('gmail-alias-toggle-wrap'),
     gmailAliasCount:      $('gmail-alias-count'),
     gmailAliasCountWrap:  $('gmail-alias-count-wrap'),
+    // Recheck & Run (SmsBower only)
+    btnRecheck:        $('btn-recheck'),
+    recheckStatus:     $('recheck-status'),
     // Proxy strip
     proxyInput:        $('proxy-input'),
     btnProxyTest:      $('btn-proxy-test'),
@@ -535,6 +538,16 @@
     }
   });
 
+  document.getElementById('btn-clear-all').addEventListener('click', async () => {
+    if (!confirm('Cancel ALL running jobs and remove the entire list?')) return;
+    try {
+      const res = await api('/api/jobs/clear-all', { method: 'POST' });
+      console.log('cleared all:', res.removed);
+    } catch (err) {
+      alert('Error: ' + err.message);
+    }
+  });
+
   dom.modeSelect.addEventListener('change', async () => {
     state.mode = dom.modeSelect.value;
     saveSettings({ mode: state.mode });
@@ -852,6 +865,9 @@
     const hasAlias = modeId === 'gmail_advanced' || modeId === 'smsbower';
     dom.gmailAliasWrap.classList.toggle('hidden', !hasAlias);
     dom.gmailAliasCountWrap.classList.toggle('hidden', !hasAlias);
+    // Show Recheck & Run button only for smsbower
+    dom.btnRecheck.classList.toggle('hidden', modeId !== 'smsbower');
+    if (modeId !== 'smsbower') dom.recheckStatus.textContent = '';
     renderMailModeConfig(state.mailModes, modeId);
   }
 
@@ -975,6 +991,35 @@
     if (e.key === 'Enter') {
       e.preventDefault();
       saveProxy();
+    }
+  });
+
+  // ── Recheck & Run (SmsBower) ─────────────────────────────────────
+  dom.btnRecheck.addEventListener('click', async () => {
+    const combos = dom.comboInput.value.trim();
+    if (!combos) {
+      dom.recheckStatus.textContent = 'No combos in input.';
+      return;
+    }
+    dom.btnRecheck.disabled = true;
+    dom.recheckStatus.textContent = 'Scanning...';
+    try {
+      const res = await api('/api/smsbower/recheck', {
+        method: 'POST',
+        body: JSON.stringify({ combos }),
+      });
+      const msg = res.requeued > 0
+        ? `✓ ${res.requeued} alias queued, ${res.skipped} skipped`
+        : `No capacity left (${res.skipped} skipped)`;
+      dom.recheckStatus.textContent = msg;
+      if (res.requeued > 0) {
+        console.log('[recheck] requeued:', res.details);
+        console.log('[recheck] skipped:', res.skipped_details);
+      }
+    } catch (err) {
+      dom.recheckStatus.textContent = 'Error: ' + err.message;
+    } finally {
+      dom.btnRecheck.disabled = false;
     }
   });
 

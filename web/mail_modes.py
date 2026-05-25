@@ -259,9 +259,10 @@ def _build_smsbower_request(
         email=email,
         mail_provider="smsbower",
         smsbower_api_url=api_url,
-        otp_timeout_seconds=70.0,       # 7s delay + 30s poll + resend + 30s poll
-        otp_initial_delay_seconds=7.0,  # chờ 7s trước khi gọi API lần đầu
-        otp_max_resends=1,              # resend tối đa 1 lần, sau đó skip job
+        otp_timeout_seconds=70.0,        # 7s delay + poll code1 + chờ code2 (~60s tổng)
+        otp_initial_delay_seconds=7.0,   # chờ 7s trước khi gọi API lần đầu
+        otp_max_resends=0,               # không click Resend dù timeout
+        otp_resend_on_reject=False,      # không click Resend khi code bị reject — chờ code 2 tự về
         otp_poll_interval_seconds=3.0,
         headless=headless,
         keep_browser_open=keep_browser_open,

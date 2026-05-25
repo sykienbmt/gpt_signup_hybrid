@@ -522,6 +522,17 @@ class JobManager:
             self._broadcast({"type": "clear_finished", "removed": removed})
         return removed
 
+    def clear_all(self) -> int:
+        """Cancel running/queued rồi xoá toàn bộ jobs khỏi memory."""
+        self.stop_all()
+        removed = len(self.jobs)
+        self.jobs.clear()
+        self.order.clear()
+        self._tasks.clear()
+        if removed:
+            self._broadcast({"type": "clear_finished", "removed": removed})
+        return removed
+
     def retry_job(self, job_id: str) -> bool:
         job = self.jobs.get(job_id)
         if job is None:
@@ -756,6 +767,10 @@ class JobManager:
                 keep_browser_open=self._debug and not self._headless,
                 proxy=self._proxy,
             )
+            # Extra fields (e.g. smsbower_max_all_codes cho recheck jobs)
+            extra = getattr(job, '_extra_req_fields', None)
+            if extra:
+                request = request.model_copy(update=extra)
             result: SignupResult = await run_signup(request, log=log)
 
             # Update job email nếu đã resolve từ API (URL-only gmail_advanced)
@@ -1171,6 +1186,17 @@ class SessionJobManager:
                 self.order.remove(jid)
                 self._tasks.pop(jid, None)
                 removed += 1
+        if removed:
+            self._broadcast({"type": "clear_finished", "removed": removed})
+        return removed
+
+    def clear_all(self) -> int:
+        """Cancel running/queued rồi xoá toàn bộ jobs khỏi memory."""
+        self.stop_all()
+        removed = len(self.jobs)
+        self.jobs.clear()
+        self.order.clear()
+        self._tasks.clear()
         if removed:
             self._broadcast({"type": "clear_finished", "removed": removed})
         return removed
@@ -1737,6 +1763,17 @@ class LinkJobManager:
                 self.order.remove(jid)
                 self._tasks.pop(jid, None)
                 removed += 1
+        if removed:
+            self._broadcast({"type": "clear_finished", "removed": removed})
+        return removed
+
+    def clear_all(self) -> int:
+        """Cancel running/queued rồi xoá toàn bộ jobs khỏi memory."""
+        self.stop_all()
+        removed = len(self.jobs)
+        self.jobs.clear()
+        self.order.clear()
+        self._tasks.clear()
         if removed:
             self._broadcast({"type": "clear_finished", "removed": removed})
         return removed

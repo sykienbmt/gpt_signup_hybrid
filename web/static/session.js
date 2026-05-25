@@ -27,6 +27,7 @@
     errorPane:    $('ses-error-pane'),
     btnCopyError:   $('ses-btn-copy-error'),
     btnClearDone:   $('ses-btn-clear-done'),
+    btnClearAll:    $('ses-btn-clear-all'),
   };
 
   // ── Helpers ───────────────────────────────────────────────────────
@@ -262,6 +263,13 @@
   dom.btnClearDone.addEventListener('click', async () => {
     try {
       await api('/api/session/jobs/clear-finished', { method: 'POST' });
+    } catch (err) { alert(err.message); }
+  });
+
+  dom.btnClearAll.addEventListener('click', async () => {
+    if (!confirm('Cancel ALL running jobs and remove the entire list?')) return;
+    try {
+      await api('/api/session/jobs/clear-all', { method: 'POST' });
     } catch (err) { alert(err.message); }
   });
 

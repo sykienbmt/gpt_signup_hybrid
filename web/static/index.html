@@ -116,8 +116,10 @@
     <div class="card-actions">
       <button id="btn-run" class="btn btn-primary">Run</button>
       <button id="btn-stop-all" class="btn btn-danger">Stop All</button>
+      <button id="btn-recheck" class="btn btn-warning hidden" title="Quét lại OTP capacity, queue alias email còn dùng được">Recheck &amp; Run</button>
       <button id="btn-clear-input" class="btn btn-ghost">Clear Input</button>
       <span class="muted" id="combo-count">0 combos</span>
+      <span id="recheck-status" class="muted" style="font-size:12px;"></span>
     </div>
   </section>
 
@@ -126,6 +128,7 @@
       <h2>Jobs</h2>
       <div class="card-head-actions">
         <button id="btn-clear-done" class="btn btn-ghost btn-small" title="Remove finished jobs from memory">Clear Done</button>
+        <button id="btn-clear-all" class="btn btn-danger btn-small" title="Cancel running jobs and remove all from memory">Clear All</button>
         <span class="muted" id="job-summary">0 total</span>
       </div>
     </header>
@@ -194,6 +197,7 @@
       <h2>Jobs</h2>
       <div class="card-head-actions">
         <button id="ses-btn-clear-done" class="btn btn-ghost btn-small">Clear Done</button>
+        <button id="ses-btn-clear-all" class="btn btn-danger btn-small" title="Cancel running jobs and remove all from memory">Clear All</button>
         <span class="muted" id="ses-job-summary">0 total</span>
       </div>
     </header>
@@ -262,6 +266,7 @@
       <h2>Jobs</h2>
       <div class="card-head-actions">
         <button id="link-btn-clear-done" class="btn btn-ghost btn-small">Clear Done</button>
+        <button id="link-btn-clear-all" class="btn btn-danger btn-small" title="Cancel running jobs and remove all from memory">Clear All</button>
         <span class="muted" id="link-job-summary">0 total</span>
       </div>
     </header>
@@ -401,6 +406,7 @@
       <span class="qr-modal-title">Payment QR</span>
       <button id="qr-modal-close" class="icon-btn" title="Close">✕</button>
     </div>
+    <div id="qr-modal-email" class="qr-modal-email"></div>
     <div id="qr-canvas-wrap"></div>
     <div id="qr-modal-url" class="qr-modal-url muted"></div>
   </div>

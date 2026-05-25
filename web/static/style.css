@@ -635,6 +635,15 @@ body {
   border-color: var(--red);
 }
 
+.btn-warning {
+  color: #f59e0b;
+}
+
+.btn-warning:hover {
+  background: rgba(245,158,11,0.12);
+  border-color: #f59e0b;
+}
+
 /* Job list */
 .job-list {
   flex: 1;
@@ -1183,6 +1192,13 @@ body {
   max-width: 460px;
   word-break: break-all;
   text-align: center;
+}
+.qr-modal-email {
+  font-size: 15px;
+  font-weight: 600;
+  text-align: center;
+  margin-bottom: 8px;
+  color: var(--fg);
 }
 
 /* ── Converter tab ── */
