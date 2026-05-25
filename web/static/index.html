@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>GSH · Tool</title>
+<title>GSH · Get Link</title>
 <link rel="stylesheet" href="/static/style.css?v=__ASSET_VERSION__" />
 </head>
 <body>
@@ -11,33 +11,12 @@
   <div class="brand">
     <span class="brand-dot"></span>
     <span class="brand-name">GSH</span>
-    <span class="brand-tag">Batch signup + 2FA</span>
+    <span class="brand-tag">Get Payment Link</span>
   </div>
   <nav class="tab-nav">
-    <button class="tab-btn active" data-tab="reg">Reg</button>
-    <button class="tab-btn" data-tab="session">Get Session</button>
-    <button class="tab-btn" data-tab="link">Get Link</button>
-    <button class="tab-btn" data-tab="check">Check Account</button>
-    <button class="tab-btn" data-tab="converter">Converter</button>
+    <button class="tab-btn active" data-tab="link">Get Link</button>
   </nav>
   <div class="topbar-actions">
-    <label class="select-wrap">
-      <span>Mode</span>
-      <select id="mode">
-        <option value="single">Single (1 at a time)</option>
-        <option value="multi">Multi (2 parallel)</option>
-      </select>
-    </label>
-    <label class="toggle-wrap" title="Bật để ẩn cửa sổ trình duyệt khi chạy">
-      <input type="checkbox" id="headless-toggle" checked />
-      <span class="toggle-track"><span class="toggle-thumb"></span></span>
-      <span class="toggle-label">Headless</span>
-    </label>
-    <label class="toggle-wrap" title="Giữ browser mở sau khi job xong (chỉ khi headed)">
-      <input type="checkbox" id="debug-toggle" />
-      <span class="toggle-track"><span class="toggle-thumb"></span></span>
-      <span class="toggle-label">Debug</span>
-    </label>
     <span id="status-pill" class="pill pill-idle">idle</span>
   </div>
 </header>
@@ -65,166 +44,8 @@
   </div>
 </section>
 
-<!-- ════════════════ TAB: REG ════════════════ -->
-<main class="grid tab-content active" id="tab-reg">
-  <section class="card card-input">
-    <header class="card-head">
-      <h2>Input Combos</h2>
-      <span class="muted card-head-note" id="input-hint">One combo per line: email|password|refresh_token|client_id</span>
-    </header>
-    <!-- Mail Mode + Worker config: 1 row, label trên / control dưới -->
-    <div class="mail-mode-row">
-      <label class="input-group config-field-mode">
-        <span class="input-label">Mail Mode</span>
-        <select id="mail-mode-select"></select>
-      </label>
-      <div id="mail-mode-config-host" class="mail-mode-config-host"></div>
-    </div>
-    <textarea class="combo-textarea" id="combo-input" placeholder="email1@hotmail.com|pwd1|M.C548...|9e5f94bc-...&#10;email2@outlook.com|pwd2|M.C525...|9e5f94bc-..."></textarea>
-    <div class="card-settings">
-      <div class="card-settings-row card-settings-row-mixed">
-        <label class="input-group config-field-long">
-          <span class="input-label">Default password</span>
-          <input type="text" id="default-password" placeholder="Leave blank for random" autocomplete="off" spellcheck="false" />
-        </label>
-        <label class="input-group config-field-short">
-          <span class="input-label">Timeout (s/job)</span>
-          <input type="number" id="job-timeout" value="240" min="30" max="600" step="10" />
-        </label>
-        <span class="settings-divider" aria-hidden="true"></span>
-        <label class="toggle-wrap" title="Fetch session JSON after signup + 2FA finishes">
-          <input type="checkbox" id="post-reg-session-toggle" />
-          <span class="toggle-track"><span class="toggle-thumb"></span></span>
-          <span class="toggle-label">Fetch Session</span>
-        </label>
-        <label class="toggle-wrap" title="Fetch payment link after signup + 2FA finishes">
-          <input type="checkbox" id="post-reg-link-toggle" />
-          <span class="toggle-track"><span class="toggle-thumb"></span></span>
-          <span class="toggle-label">Fetch Link</span>
-        </label>
-        <label class="toggle-wrap hidden" id="gmail-alias-toggle-wrap" title="Tạo alias +gshN cho mỗi Gmail thuê để tối ưu số account">
-          <input type="checkbox" id="gmail-alias-toggle" />
-          <span class="toggle-track"><span class="toggle-thumb"></span></span>
-          <span class="toggle-label">Gmail Alias</span>
-        </label>
-        <label class="input-group hidden" id="gmail-alias-count-wrap" style="flex-direction:row;align-items:center;gap:4px;">
-          <span class="input-label" style="white-space:nowrap;">×</span>
-          <input type="number" id="gmail-alias-count" value="1" min="1" max="10" step="1" style="width:52px;" title="Số alias cần tạo (1-10)" />
-        </label>
-      </div>
-    </div>
-    <div class="card-actions">
-      <button id="btn-run" class="btn btn-primary">Run</button>
-      <button id="btn-stop-all" class="btn btn-danger">Stop All</button>
-      <button id="btn-recheck" class="btn btn-warning hidden" title="Quét lại OTP capacity, queue alias email còn dùng được">Recheck &amp; Run</button>
-      <button id="btn-clear-input" class="btn btn-ghost">Clear Input</button>
-      <span class="muted" id="combo-count">0 combos</span>
-      <span id="recheck-status" class="muted" style="font-size:12px;"></span>
-    </div>
-  </section>
-
-  <section class="card card-jobs">
-    <header class="card-head">
-      <h2>Jobs</h2>
-      <div class="card-head-actions">
-        <button id="btn-clear-done" class="btn btn-ghost btn-small" title="Remove finished jobs from memory">Clear Done</button>
-        <button id="btn-clear-all" class="btn btn-danger btn-small" title="Cancel running jobs and remove all from memory">Clear All</button>
-        <span class="muted" id="job-summary">0 total</span>
-      </div>
-    </header>
-    <div id="job-list" class="job-list">
-      <div class="empty">No jobs yet. Paste combos and click Run.</div>
-    </div>
-  </section>
-
-  <section class="card card-log">
-    <header class="card-head">
-      <h2>Log</h2>
-      <span class="muted" id="log-target">—</span>
-    </header>
-    <pre id="log-pane" class="log-pane"></pre>
-  </section>
-
-  <section class="card card-success">
-    <header class="card-head">
-      <h2>Success output</h2>
-      <div class="success-tab-row">
-        <button class="success-tab-btn active" data-stab="basic">Basic</button>
-        <button class="success-tab-btn" data-stab="with-session">With Session</button>
-      </div>
-      <div class="card-head-actions">
-        <button id="btn-fetch-sessions" class="btn btn-ghost btn-small hidden" title="Fetch /api/auth/session cho tất cả jobs success">Fetch Sessions</button>
-        <span id="fetch-sessions-status" class="muted"></span>
-        <button id="btn-copy-success" class="btn btn-ghost btn-small">Copy All</button>
-      </div>
-    </header>
-    <pre id="success-pane" class="output-pane">Format: email|password|secret_2fa</pre>
-  </section>
-
-  <section class="card card-error">
-    <header class="card-head">
-      <h2>Error output</h2>
-      <button id="btn-copy-error" class="btn btn-ghost btn-small">Copy All</button>
-    </header>
-    <pre id="error-pane" class="output-pane">No errors yet.</pre>
-  </section>
-</main>
-
-<!-- ════════════════ TAB: GET SESSION ════════════════ -->
-<main class="grid tab-content" id="tab-session">
-  <section class="card card-input">
-    <header class="card-head">
-      <h2>Input</h2>
-      <span class="muted card-head-note">One line per combo: email|password|2fa_secret</span>
-    </header>
-    <textarea class="combo-textarea" id="ses-combo-input" placeholder="email@hotmail.com|password123|DNPARKKMM5EYOPDG...&#10;email2@hotmail.com|pass456|I77PEBZQNEBE67SU..."></textarea>
-    <div class="card-settings">
-      <label class="input-group settings-field-compact">
-        <span class="input-label">Timeout (s/job)</span>
-        <input type="number" id="ses-job-timeout" value="120" min="30" max="600" step="10" />
-      </label>
-    </div>
-    <div class="card-actions">
-      <button id="ses-btn-run" class="btn btn-primary">Get Session</button>
-      <button id="ses-btn-stop-all" class="btn btn-danger">Stop All</button>
-      <button id="ses-btn-clear-input" class="btn btn-ghost">Clear Input</button>
-      <span class="muted" id="ses-combo-count">0 combos</span>
-    </div>
-  </section>
-
-  <section class="card card-jobs">
-    <header class="card-head">
-      <h2>Jobs</h2>
-      <div class="card-head-actions">
-        <button id="ses-btn-clear-done" class="btn btn-ghost btn-small">Clear Done</button>
-        <button id="ses-btn-clear-all" class="btn btn-danger btn-small" title="Cancel running jobs and remove all from memory">Clear All</button>
-        <span class="muted" id="ses-job-summary">0 total</span>
-      </div>
-    </header>
-    <div id="ses-job-list" class="job-list">
-      <div class="empty">Paste combos and click Get Session.</div>
-    </div>
-  </section>
-
-  <section class="card card-log">
-    <header class="card-head">
-      <h2>Log</h2>
-      <span class="muted" id="ses-log-target">—</span>
-    </header>
-    <pre id="ses-log-pane" class="log-pane"></pre>
-  </section>
-
-  <section class="card card-error card-span-full">
-    <header class="card-head">
-      <h2>Error output</h2>
-      <button id="ses-btn-copy-error" class="btn btn-ghost btn-small">Copy All</button>
-    </header>
-    <pre id="ses-error-pane" class="output-pane">No errors yet.</pre>
-  </section>
-</main>
-
 <!-- ════════════════ TAB: GET LINK ════════════════ -->
-<main class="grid tab-content" id="tab-link">
+<main class="grid tab-content active" id="tab-link">
   <section class="card card-input">
     <header class="card-head">
       <h2>Input</h2>
@@ -234,8 +55,8 @@
         <button class="link-mode-btn" data-mode="access_token">Access Token</button>
       </div>
     </header>
-    <span class="muted card-head-note" id="link-mode-hint">One line per combo: email|password|2fa_secret</span>
-    <textarea class="combo-textarea" id="link-combo-input" placeholder="email@hotmail.com|password123|DNPARKKMM5EYOPDG...&#10;email2@outlook.com|pass456|I77PEBZQNEBE67SU..." maxlength="50000"></textarea>
+    <span class="muted card-head-note" id="link-mode-hint">One session JSON per line (each line = 1 account). Hỗ trợ paste 1 JSON nhiều dòng hoặc array.</span>
+    <textarea class="combo-textarea" id="link-combo-input" placeholder='{"accessToken":"eyJhbGci...","user":{"email":"a@x.com"}}&#10;{"accessToken":"eyJabc...","user":{"email":"b@x.com"}}' maxlength="50000"></textarea>
     <div class="card-settings">
       <div class="card-settings-row card-settings-row-mixed">
         <label class="input-group config-field-short">
@@ -250,6 +71,11 @@
         <label class="input-group settings-field-compact">
           <span class="input-label">Timeout (s/job)</span>
           <input type="number" id="link-job-timeout" value="180" min="30" max="600" step="10" />
+        </label>
+        <label class="toggle-wrap" title="Ẩn cửa sổ browser khi chạy">
+          <input type="checkbox" id="link-headless-toggle" checked />
+          <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          <span class="toggle-label">Headless</span>
         </label>
       </div>
     </div>
@@ -292,112 +118,6 @@
   </section>
 </main>
 
-<!-- ════════════════ TAB: CHECK ACCOUNT ════════════════ -->
-<main class="grid grid-check tab-content" id="tab-check">
-  <section class="card card-input">
-    <header class="card-head">
-      <h2>Input Accounts</h2>
-      <span class="muted card-head-note">One line per account: email|pass|2fa|Session (Session = JWT accessToken hoặc session JSON)</span>
-    </header>
-    <textarea class="combo-textarea" id="check-input"
-      placeholder="email@hotmail.com|pass|DNPARKKMM5EYOPDG...|eyJhbGciOi...&#10;email2@outlook.com|pass2|I77PEBZQN...|{&quot;accessToken&quot;:&quot;eyJ...&quot;}"></textarea>
-    <div class="card-settings">
-      <label class="input-group settings-field-compact">
-        <span class="input-label">Concurrent</span>
-        <input type="number" id="check-concurrent" value="5" min="1" max="10" step="1" />
-      </label>
-    </div>
-    <div class="card-actions">
-      <button id="check-btn-run" class="btn btn-primary">Check</button>
-      <button id="check-btn-clear-input" class="btn btn-ghost">Clear Input</button>
-      <button id="check-btn-clear-results" class="btn btn-ghost">Clear Results</button>
-      <button id="check-btn-clear-all" class="btn btn-danger">Clear All</button>
-      <span class="muted" id="check-input-count">0 accounts</span>
-    </div>
-  </section>
-
-  <section class="card card-jobs">
-    <header class="card-head">
-      <h2>Results</h2>
-      <div class="card-head-actions">
-        <button id="check-btn-copy-plus" class="btn btn-ghost btn-small" title="Copy chỉ những account Plus">Copy Plus</button>
-        <button id="check-btn-copy-all" class="btn btn-ghost btn-small">Copy All</button>
-        <span class="muted" id="check-summary">0 total</span>
-      </div>
-    </header>
-    <div id="check-result-list" class="job-list">
-      <div class="empty">Paste account lines and click Check.</div>
-    </div>
-  </section>
-</main>
-
-<!-- ════════════════ TAB: CONVERTER ════════════════ -->
-<main class="tab-content conv-layout" id="tab-converter">
-  <section class="card conv-panel">
-    <header class="card-head">
-      <div>
-        <h2>Session JSON</h2>
-        <span class="muted card-head-note">Paste ChatGPT session JSON, hoặc kéo thả file .json vào đây</span>
-      </div>
-    </header>
-    <div class="conv-guide">
-      <strong>Lấy session tại:</strong>
-      <a href="https://chatgpt.com/api/auth/session" target="_blank" rel="noreferrer">chatgpt.com/api/auth/session</a>
-      — copy toàn bộ JSON rồi paste xuống dưới.
-    </div>
-    <div class="card-actions">
-      <input class="hidden" id="conv-file-input" type="file" accept=".json,application/json" multiple />
-      <button class="btn btn-ghost btn-small" id="conv-pick-files">Select Files</button>
-      <button class="btn btn-ghost btn-small" id="conv-load-example">Example</button>
-      <button class="btn btn-ghost btn-small" id="conv-clear">Clear</button>
-    </div>
-    <textarea class="conv-textarea" id="conv-input" spellcheck="false"
-      placeholder='{"user":{"email":"you@example.com"},"expires":"2026-08-06T14:29:36.155Z","account":{"id":"...","planType":"plus"},"accessToken":"...","sessionToken":"..."}'>
-    </textarea>
-    <div class="conv-status" id="conv-input-status">Waiting for input.</div>
-  </section>
-
-  <section class="card conv-panel">
-    <header class="card-head">
-      <div>
-        <h2>Output</h2>
-        <span class="muted card-head-note" id="conv-output-subtitle">Format: sub2api</span>
-      </div>
-      <div class="card-head-actions">
-        <button class="btn btn-ghost btn-small" id="conv-copy" disabled>Copy</button>
-        <button class="btn btn-primary btn-small" id="conv-download" disabled>Download JSON</button>
-      </div>
-    </header>
-
-    <div class="conv-format-bar" role="group">
-      <button class="conv-fmt-btn active" data-format="sub2api">sub2api</button>
-      <button class="conv-fmt-btn" data-format="cpa">CPA</button>
-      <button class="conv-fmt-btn" data-format="cockpit">Cockpit</button>
-      <button class="conv-fmt-btn" data-format="9router">9router</button>
-      <button class="conv-fmt-btn" data-format="axonhub">AxonHub</button>
-      <button class="conv-fmt-btn" data-format="codexmanager">Codex-Manager</button>
-    </div>
-
-    <div class="conv-stats">
-      <div class="conv-stat"><span class="conv-stat-val" id="conv-stat-count">0</span><span class="conv-stat-label">Accounts</span></div>
-      <div class="conv-stat"><span class="conv-stat-val" id="conv-stat-format">sub2api</span><span class="conv-stat-label">Format</span></div>
-      <div class="conv-stat"><span class="conv-stat-val" id="conv-stat-errors">0</span><span class="conv-stat-label">Skipped</span></div>
-    </div>
-
-    <div class="conv-accounts-wrap">
-      <table class="conv-table">
-        <colgroup><col style="width:30%"/><col style="width:40%"/><col style="width:30%"/></colgroup>
-        <thead><tr><th>Name</th><th>Email</th><th>Expires</th></tr></thead>
-        <tbody id="conv-account-body"><tr><td colspan="3" class="conv-empty">No accounts yet.</td></tr></tbody>
-      </table>
-    </div>
-
-    <div class="conv-issues hidden" id="conv-issues"></div>
-    <textarea class="conv-textarea conv-output" id="conv-output" readonly spellcheck="false" placeholder="Output will appear here."></textarea>
-    <div class="conv-status" id="conv-output-status">No output yet.</div>
-  </section>
-</main>
-
 <!-- QR modal -->
 <div id="qr-modal" class="qr-modal hidden" role="dialog" aria-modal="true">
   <div class="qr-modal-backdrop"></div>
@@ -427,10 +147,7 @@
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
-<script src="/static/app.js?v=__ASSET_VERSION__"></script>
-<script src="/static/session.js?v=__ASSET_VERSION__"></script>
+<script src="/static/ui.js?v=__ASSET_VERSION__"></script>
 <script src="/static/link.js?v=__ASSET_VERSION__"></script>
-<script src="/static/check.js?v=__ASSET_VERSION__"></script>
-<script src="/static/converter.js?v=__ASSET_VERSION__"></script>
 </body>
 </html>

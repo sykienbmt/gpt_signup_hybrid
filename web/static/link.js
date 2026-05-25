@@ -41,6 +41,7 @@
     comboCount: $('link-combo-count'),
     jobTimeout: $('link-job-timeout'),
     regionSelect: $('link-region-select'),
+    headlessToggle: $('link-headless-toggle'),
     jobList: $('link-job-list'),
     jobSummary: $('link-job-summary'),
     logPane: $('link-log-pane'),
@@ -275,6 +276,7 @@
             state.region = data.region;
             dom.regionSelect.value = data.region;
           }
+          if (data.headless !== undefined) dom.headlessToggle.checked = data.headless;
           applySnapshot(data.jobs || []);
         } else if (data.type === 'job') {
           applyJobUpdate(data.job);
@@ -404,6 +406,15 @@
       await api('/api/link/config', {
         method: 'POST',
         body: JSON.stringify({ region: state.region }),
+      });
+    } catch (err) { console.error(err); }
+  });
+
+  dom.headlessToggle.addEventListener('change', async () => {
+    try {
+      await api('/api/link/config', {
+        method: 'POST',
+        body: JSON.stringify({ headless: dom.headlessToggle.checked }),
       });
     } catch (err) { console.error(err); }
   });

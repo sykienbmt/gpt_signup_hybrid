@@ -408,9 +408,9 @@ async def run_upi_automation(
         await asyncio.sleep(2)
 
         _log("[upi] waiting for UPI accordion to appear")
-        appeared = await _wait_for_upi_accordion(page, timeout_ms=20_000)
+        appeared = await _wait_for_upi_accordion(page, timeout_ms=30_000)
         if not appeared:
-            _log("[upi] ⚠️ UPI accordion not detected after 20s")
+            _log("[upi] ⚠️ UPI accordion not detected after 30s")
 
         _log("[upi] clicking UPI accordion")
         clicked = await _click_upi_accordion(page)
@@ -459,7 +459,7 @@ async def run_upi_automation(
             'img[src*="qr.stripe.com"]'
         )
         qr_element = None
-        qr_deadline = time.monotonic() + 20.0
+        qr_deadline = time.monotonic() + 30.0
         while time.monotonic() < qr_deadline:
             for frame in page.frames:
                 try:
@@ -526,10 +526,10 @@ async def run_upi_automation(
                 "qr_captured": True,
             }
 
-        _log("[upi] ❌ UPI QR not detected within 20s — failing")
+        _log("[upi] ❌ UPI QR not detected within 30s — failing")
         return {
             "ok": False,
-            "error": "UPI QR not detected within 20s",
+            "error": "UPI QR not detected within 30s",
             "screenshots": screenshots,
             "payment_link": payment_url,
             "qr_captured": False,
