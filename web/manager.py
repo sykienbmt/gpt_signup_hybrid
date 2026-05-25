@@ -1,4 +1,4 @@
-﻿"""Job manager: queue + concurrency control + broadcast events."""
+"""Job manager: queue + concurrency control + broadcast events."""
 from __future__ import annotations
 
 import asyncio
@@ -956,6 +956,8 @@ class SessionJob:
         d = self.to_dict()
         d["log_lines"] = list(self.log_lines)
         d["session_data"] = self.session_data
+        d["password"] = self.password
+        d["secret"] = self.secret
         return d
 
 
@@ -1787,6 +1789,16 @@ class LinkJobManager:
             task.cancel()
             job.status = "cancelled"
             job.finished_at = time.time()
+        # Delete associated screenshot files
+        _screenshot_dir = Path(__file__).resolve().parent.parent / "runtime" / "upi_screenshots"
+        for url in (job.screenshot_urls or []):
+            fname = url.split("/")[-1]
+            fpath = _screenshot_dir / fname
+            try:
+                if fpath.exists():
+                    fpath.unlink()
+            except Exception:
+                pass
         self.jobs.pop(job_id, None)
         if job_id in self.order:
             self.order.remove(job_id)

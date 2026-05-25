@@ -47,7 +47,7 @@ def _stamp_email(fpath: Path, label: str) -> None:
         pad_x, pad_y = 14, 6
         x = (img.width - text_w) // 2 - pad_x
         y = 0
-        draw.rectangle([x, y, x + text_w + pad_x * 2, y + text_h + pad_y * 2], fill=(200, 0, 0, 220))
+        draw.rectangle([x, y, x + text_w + pad_x * 2, y + text_h + pad_y * 2], fill=(30, 100, 220, 220))
         draw.text((x + pad_x, y + pad_y), label, font=font, fill=(255, 255, 255, 255))
         img = img.convert("RGB")
         img.save(fpath, format="PNG")

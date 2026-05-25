@@ -28,6 +28,7 @@
     btnCopyError:   $('ses-btn-copy-error'),
     btnClearDone:   $('ses-btn-clear-done'),
     btnClearAll:    $('ses-btn-clear-all'),
+    btnExport:      $('ses-btn-export'),
   };
 
   // ── Helpers ───────────────────────────────────────────────────────
@@ -84,6 +85,7 @@
         actionBtns = `<button class="icon-btn icon-danger" data-action="stop" data-id="${escHtml(id)}" title="Stop">${window.GptUi.icon('stop')}</button>`;
       } else if (j.status === 'success') {
         actionBtns = `
+          <button class="icon-btn" data-action="copy-combo" data-id="${escHtml(id)}" title="Copy email|pass|2fa|json">📋</button>
           <button class="icon-btn" data-action="download" data-id="${escHtml(id)}" title="Download JSON">${window.GptUi.icon('download')}</button>
           <button class="icon-btn" data-action="copy-json" data-id="${escHtml(id)}" title="Copy JSON">${window.GptUi.icon('copy')}</button>
           <button class="icon-btn" data-action="copy-token" data-id="${escHtml(id)}" title="Copy access token">${window.GptUi.icon('token')}</button>
@@ -181,6 +183,20 @@
         api(`/api/session/jobs/${id}`, { method: 'DELETE' }).catch((err) => alert(err.message));
       } else if (action === 'remove') {
         api(`/api/session/jobs/${id}`, { method: 'DELETE' }).catch((err) => alert(err.message));
+      } else if (action === 'copy-combo') {
+        const btn = actionBtn;
+        api(`/api/session/jobs/${id}`).then((res) => {
+          const j2 = state.jobs.get(id);
+          const email = j2 ? j2.email : id;
+          const pass = res.password || '';
+          const twofa = res.secret || '';
+          const json = res.session_data ? JSON.stringify(res.session_data) : '';
+          const line = `${email}|${pass}|${twofa}|${json}`;
+          window.GptUi.copyText(line);
+          const orig = btn.textContent;
+          btn.textContent = '✅';
+          setTimeout(() => { btn.textContent = orig; }, 1500);
+        }).catch((err) => alert('Copy lỗi: ' + err.message));
       } else if (action === 'download' || action === 'copy-json' || action === 'copy-token') {
         // Lấy session data
         const cached = sessionCache.get(id);
@@ -287,6 +303,55 @@
   // ── Copy error button ──────────────────────────────────────────────
   dom.btnCopyError.addEventListener('click', () => {
     window.GptUi.copyText(dom.errorPane.textContent);
+  });
+
+  // ── Export button ─────────────────────────────────────────────────
+  dom.btnExport.addEventListener('click', async () => {
+    const successIds = state.order.filter((id) => {
+      const j = state.jobs.get(id);
+      return j && j.status === 'success' && j.has_session;
+    });
+    if (!successIds.length) { alert('Không có session thành công nào để export.'); return; }
+
+    dom.btnExport.disabled = true;
+    dom.btnExport.textContent = '⏳ Exporting…';
+    try {
+      const lines = await Promise.all(successIds.map(async (id) => {
+        let data = sessionCache.get(id);
+        let password = null;
+        let secret = null;
+        if (!data) {
+          const res = await api(`/api/session/jobs/${id}`);
+          if (res.session_data) { sessionCache.set(id, res.session_data); data = res.session_data; }
+          password = res.password;
+          secret = res.secret;
+        } else {
+          // Re-fetch to get password/secret (not cached separately)
+          const res = await api(`/api/session/jobs/${id}`);
+          password = res.password;
+          secret = res.secret;
+        }
+        const j = state.jobs.get(id);
+        const email = j ? j.email : id;
+        const pass = password || '';
+        const twofa = secret || '';
+        const json = data ? JSON.stringify(data) : '';
+        return `${email}|${pass}|${twofa}|${json}`;
+      }));
+      const content = lines.join('\n');
+      const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 16);
+      const filename = `sessions-${ts}.txt`;
+      const blob = new Blob([content], { type: 'text/plain' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = filename; a.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      alert('Export lỗi: ' + err.message);
+    } finally {
+      dom.btnExport.disabled = false;
+      dom.btnExport.textContent = '⬇ Export';
+    }
   });
 
   // ── SSE ───────────────────────────────────────────────────────────

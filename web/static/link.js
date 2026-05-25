@@ -179,7 +179,7 @@
 
       const shots = (job.screenshot_urls && job.screenshot_urls.length)
         ? `<div class="job-meta">📸 ${job.screenshot_urls.map((u, i) =>
-            `<a href="${escHtml(u)}" data-action="show-shot" data-url="${escHtml(u)}" class="shot-link" title="${escHtml(u)}">shot${job.screenshot_urls.length > 1 ? (i + 1) : ''}</a>`
+            `<a href="${escHtml(u)}" data-action="show-shot" data-url="${escHtml(u)}" class="shot-link" title="Xem ảnh">shot${job.screenshot_urls.length > 1 ? (i + 1) : ''}</a><button class="shot-copy-btn" data-action="copy-shot" data-url="${escHtml(u)}" title="Copy ảnh vào clipboard">📋</button>`
           ).join(' · ')}</div>`
         : '';
 
@@ -314,6 +314,22 @@
         event.preventDefault();
         const url = actionBtn.dataset.url;
         if (url) showShotModal(url);
+      } else if (action === 'copy-shot') {
+        event.preventDefault();
+        const url = actionBtn.dataset.url;
+        if (!url) return;
+        fetch(url)
+          .then((r) => r.blob())
+          .then((blob) => {
+            const item = new ClipboardItem({ [blob.type || 'image/png']: blob });
+            return navigator.clipboard.write([item]);
+          })
+          .then(() => {
+            const orig = actionBtn.textContent;
+            actionBtn.textContent = '✅';
+            setTimeout(() => { actionBtn.textContent = orig; }, 1500);
+          })
+          .catch((err) => alert('Không copy được ảnh: ' + err.message));
       } else if (action === 'upi-fill') {
         if (state.upiInProgress.has(id)) return;
         state.upiInProgress.add(id);
