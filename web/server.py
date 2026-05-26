@@ -17,6 +17,7 @@ from .manager import get_manager, get_session_manager, get_link_manager
 from .mail_modes import get_registry, serialize_for_api
 from .upi_automation import run_upi_automation
 from .check_account import check_accounts
+from ..mail_providers import smsbower_dot_alias, smsbower_existing_dot_position
 
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -225,15 +226,9 @@ async def smsbower_recheck(body: RecheckBody) -> JSONResponse:
             skipped.append({"email": email, "reason": f"all_codes={codes_count} — inbox full"})
             continue
 
-        # Còn capacity → thêm 1 dấu chấm ở vị trí random trong local part
-        base_local = email.split("+")[0].split("@")[0]
-        domain = email.split("@", 1)[1]
-        if len(base_local) >= 2:
-            pos = random.randint(1, len(base_local) - 1)
-            dot_local = base_local[:pos] + "." + base_local[pos:]
-        else:
-            dot_local = base_local + ".x"
-        alias_email = f"{dot_local}@{domain}"
+        # Còn capacity → strip dot hiện tại, chèn 1 dot mới ở vị trí khác
+        current_pos = smsbower_existing_dot_position(email)
+        alias_email = smsbower_dot_alias(email, avoid_position=current_pos)
         combo = f"{alias_email}----{url}"
         combos_to_add.append(combo)
         extra_fields_map[combo] = {"smsbower_max_all_codes": 2}

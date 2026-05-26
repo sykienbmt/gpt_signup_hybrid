@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 import re
 import ssl
 import time
@@ -18,6 +19,41 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import quote
+
+
+def smsbower_dot_alias(email: str, *, avoid_position: int | None = None) -> str:
+    """SmsBower Gmail alias: strip mọi dot khỏi local part rồi chèn lại 1 dot
+    ở vị trí random (1..len-1). avoid_position nếu set sẽ tránh đúng vị trí đó
+    (dùng cho recheck — pick vị trí khác lần trước)."""
+    if "@" not in email:
+        return email
+    local, _, domain = email.partition("@")
+    plus_idx = local.find("+")
+    if plus_idx != -1:
+        base_with_dots = local[:plus_idx]
+        plus_tail = local[plus_idx:]
+    else:
+        base_with_dots = local
+        plus_tail = ""
+    base = base_with_dots.replace(".", "")
+    if len(base) < 2:
+        return email
+    candidates = [p for p in range(1, len(base)) if p != avoid_position]
+    if not candidates:
+        candidates = list(range(1, len(base)))
+    pos = random.choice(candidates)
+    new_local = base[:pos] + "." + base[pos:] + plus_tail
+    return f"{new_local}@{domain}"
+
+
+def smsbower_existing_dot_position(email: str) -> int | None:
+    """Trả về vị trí dot trong base local (tính từ 0). None nếu không có hoặc nhiều dot."""
+    if "@" not in email:
+        return None
+    local = email.split("@", 1)[0].split("+", 1)[0]
+    if local.count(".") != 1:
+        return None
+    return local.index(".")
 
 import httpx
 

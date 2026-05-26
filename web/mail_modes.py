@@ -15,6 +15,7 @@ from ..mail_providers import (
     OutlookCombo, OutlookComboError,
     GmailAdvancedProvider, GmailAdvancedParseError,
     SmsBowerProvider, SmsBowerParseError,
+    smsbower_dot_alias,
 )
 from ..models import SignupRequest
 
@@ -232,12 +233,18 @@ GMAIL_ADVANCED_MODE = MailModeSpec(
 
 
 def _parse_smsbower_line(line: str) -> ParsedLine:
-    """Parse line `email----api_url` cho SmsBower."""
+    """Parse line `email----api_url` cho SmsBower.
+
+    Tự động apply 1-dot Gmail alias ngay khi import để mỗi lần signup dùng
+    một biến thể khác inbox-mapping (cùng inbox vật lý nhưng OpenAI thấy email khác).
+    """
     try:
         email, api_url = SmsBowerProvider.parse_line(line)
     except SmsBowerParseError as exc:
         raise SmsBowerModeParseError(str(exc)) from exc
-    return ParsedLine(email=email, raw=line)
+    aliased = smsbower_dot_alias(email)
+    aliased_line = f"{aliased}{SmsBowerProvider.SEPARATOR}{api_url}"
+    return ParsedLine(email=aliased, raw=aliased_line)
 
 
 def _build_smsbower_request(
