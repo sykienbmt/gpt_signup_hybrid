@@ -7,17 +7,19 @@
 
   const $ = (id) => document.getElementById(id);
   const dom = {
-    input:      $('cp-input'),
-    btnRun:     $('cp-btn-run'),
-    btnClear:   $('cp-btn-clear'),
-    region:     $('cp-region'),
-    count:      $('cp-count'),
-    resultList: $('cp-result-list'),
-    summary:    $('cp-summary'),
-    logPanel:   $('cp-log-panel'),
-    logLabel:   $('cp-log-label'),
-    logBody:    $('cp-log-body'),
-    logClose:   $('cp-log-close'),
+    input:           $('cp-input'),
+    btnRun:          $('cp-btn-run'),
+    btnClear:        $('cp-btn-clear'),
+    btnClearResults: $('cp-btn-clear-results'),
+    region:          $('cp-region'),
+    parallel:        $('cp-parallel'),
+    count:           $('cp-count'),
+    resultList:      $('cp-result-list'),
+    summary:         $('cp-summary'),
+    logPanel:        $('cp-log-panel'),
+    logLabel:        $('cp-log-label'),
+    logBody:         $('cp-log-body'),
+    logClose:        $('cp-log-close'),
   };
 
   // ── State ─────────────────────────────────────────────────────────────
@@ -54,6 +56,21 @@
     return null;
   }
 
+  // ── Concurrency pool: run tasks with max N simultaneous ───────────────
+  async function runPool(tasks, limit) {
+    const results = new Array(tasks.length);
+    let idx = 0;
+    async function worker() {
+      while (idx < tasks.length) {
+        const i = idx++;
+        results[i] = await tasks[i]();
+      }
+    }
+    const workers = Array.from({ length: Math.min(limit, tasks.length) }, worker);
+    await Promise.all(workers);
+    return results;
+  }
+
   // ── Count update ──────────────────────────────────────────────────────
   function updateCount() {
     const n = dom.input.value.split('\n').filter(l => l.trim()).length;
@@ -67,7 +84,7 @@
     const s = _sessions[i];
     const email = (r && r.email) || s.email || `#${i + 1}`;
 
-    const copyEmailBtn = `<button class="icon-btn" onclick="event.stopPropagation();window.GptUi.copyText(${JSON.stringify(email)})" title="Copy email">📧</button>`;
+    const copyEmailBtn = `<button class="icon-btn" onclick="event.stopPropagation();window.GptUi.copyText(${escHtml(JSON.stringify(email))})" title="Copy email">📧</button>`;
     const logBtn = `<button class="icon-btn cp-log-btn" data-idx="${i}" title="Show log">📋</button>`;
 
     // Still checking
@@ -84,7 +101,7 @@
 
     // Partial: has URL but Stripe data missing
     if (r.error && r.payment_url) {
-      const linkBtn = `<button class="icon-btn" onclick="event.stopPropagation();window.GptUi.copyText(${JSON.stringify(r.payment_url)})" title="Copy link">🔗</button>`;
+      const linkBtn = `<button class="icon-btn" onclick="event.stopPropagation();window.GptUi.copyText(${escHtml(JSON.stringify(r.payment_url))})" title="Copy link">🔗</button>`;
       return `<div class="job-compact cp-result-item" data-idx="${i}" style="border-left:3px solid #f5a623">
         <div class="job-index">${i + 1}</div>
         <div class="job-status status-running">?</div>
@@ -116,7 +133,7 @@
       ? `✅ FREE${r.trial_days ? ` (${r.trial_days}d)` : ''}`
       : `💳 ${escHtml(fmtAmount(r.amount_due, r.currency))}`;
     const linkBtn = r.payment_url
-      ? `<button class="icon-btn" onclick="event.stopPropagation();window.GptUi.copyText(${JSON.stringify(r.payment_url)})" title="Copy link">🔗</button>`
+      ? `<button class="icon-btn" onclick="event.stopPropagation();window.GptUi.copyText(${escHtml(JSON.stringify(r.payment_url))})" title="Copy link">🔗</button>`
       : '';
 
     return `<div class="job-compact cp-result-item" data-idx="${i}" style="border-left:3px solid ${color}">
@@ -191,11 +208,16 @@
     if (row) showLog(parseInt(row.dataset.idx, 10));
   });
 
-  // ── Clear ─────────────────────────────────────────────────────────────
+  // ── Clear input ───────────────────────────────────────────────────────
   dom.btnClear.addEventListener('click', () => {
     if (_running) return;
     dom.input.value = '';
     updateCount();
+  });
+
+  // ── Clear results ─────────────────────────────────────────────────────
+  dom.btnClearResults.addEventListener('click', () => {
+    if (_running) return;
     dom.resultList.innerHTML = '<div class="empty">Paste sessions and click Check.</div>';
     dom.summary.textContent = '';
     dom.logPanel.style.display = 'none';
@@ -224,11 +246,12 @@
     dom.resultList.innerHTML = parsed.map((_, i) => renderCard(i)).join('');
 
     const region = dom.region.value || 'VN';
+    const concurrency = parseInt(dom.parallel.value, 10) || 10;
     const apiToken = window.GptUi?.apiToken || '';
     const headers = { 'Content-Type': 'application/json', ...(apiToken ? { 'X-API-Token': apiToken } : {}) };
 
-    // Process all sessions in parallel, update UI as each completes
-    await Promise.allSettled(parsed.map(async (session, i) => {
+    // Process sessions with bounded concurrency pool, update UI as each completes
+    const tasks = parsed.map((session, i) => async () => {
       try {
         const res = await fetch('/api/check-payment', {
           method: 'POST',
@@ -242,9 +265,10 @@
       }
       updateCardDOM(i);
       updateSummary();
-      // If this item is selected and now has logs, refresh the log panel
       if (_selectedIdx === i) showLog(i);
-    }));
+    });
+
+    await runPool(tasks, concurrency);
 
     _running = false;
     dom.btnRun.disabled = false;

@@ -452,14 +452,14 @@ async def run_upi_automation(
                 _log(f"[upi] ⚠️ screenshot failed: {exc}")
                 return None
 
-        # Wait up to 20s for Stripe UPI QR popup to appear (search all frames since
+        # Wait up to 40s for Stripe UPI QR popup to appear (search all frames since
         # the QR is typically rendered inside a Stripe-hosted iframe).
         qr_selector = (
             'img[data-testid="QRCode-image"], img.QRCode-image, '
             'img[src*="qr.stripe.com"]'
         )
         qr_element = None
-        qr_deadline = time.monotonic() + 20.0
+        qr_deadline = time.monotonic() + 40.0
         while time.monotonic() < qr_deadline:
             for frame in page.frames:
                 try:
@@ -526,10 +526,10 @@ async def run_upi_automation(
                 "qr_captured": True,
             }
 
-        _log("[upi] ❌ UPI QR not detected within 20s — failing")
+        _log("[upi] ❌ UPI QR not detected within 40s — failing")
         return {
             "ok": False,
-            "error": "UPI QR not detected within 20s",
+            "error": "UPI QR not detected within 40s",
             "screenshots": screenshots,
             "payment_link": payment_url,
             "qr_captured": False,

@@ -16,6 +16,7 @@ from .auth import get_token  # legacy — token auth disabled
 from .manager import get_manager, get_session_manager, get_link_manager
 from .mail_modes import get_registry, serialize_for_api
 from .upi_automation import run_upi_automation
+from .upi_watch import UpiWatchManager
 from .check_account import check_accounts
 from ..mail_providers import smsbower_dot_alias, smsbower_existing_dot_position
 
@@ -1092,6 +1093,134 @@ async def check_payment_sessions(request: Request) -> JSONResponse:
             results.append({"email": hint_email, "error": str(e), "logs": logs})
 
     return JSONResponse({"results": results})
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Stripe payment polling
+# ─────────────────────────────────────────────────────────────────────
+
+
+@app.post("/api/stripe/poll-paid")
+async def stripe_poll_paid(request: Request) -> JSONResponse:
+    """Poll a Stripe checkout session for payment completion (UPI India).
+
+    Body: { session_id, publishable_key }
+    Returns: { paid: bool, status: str, subscription_status: str | null }
+    """
+    from ..payment_link import _call_stripe_init_full, _IMPERSONATE, StripeInitError
+    from curl_cffi.requests import AsyncSession as CurlSession
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="Invalid JSON body")
+
+    session_id: str = body.get("session_id") or ""
+    publishable_key: str = body.get("publishable_key") or ""
+    if not session_id or not publishable_key:
+        raise HTTPException(status_code=422, detail="session_id and publishable_key required")
+
+    try:
+        async with CurlSession(impersonate=_IMPERSONATE) as curl_session:
+            data = await _call_stripe_init_full(
+                curl_session, session_id, publishable_key, timeout=15.0,
+            )
+    except StripeInitError as e:
+        return JSONResponse({"paid": False, "status": "error", "error": str(e)})
+    except Exception as e:
+        return JSONResponse({"paid": False, "status": "error", "error": str(e)})
+
+    pi = data.get("payment_intent") or {}
+    pi_status = pi.get("status") or ""
+    sub = data.get("subscription") or {}
+    sub_status = sub.get("status") or ""
+
+    paid = pi_status == "succeeded" or sub_status == "active"
+    return JSONResponse({
+        "paid": paid,
+        "pi_status": pi_status,
+        "sub_status": sub_status,
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────
+# UPI Watch Mode
+# ─────────────────────────────────────────────────────────────────────
+
+def _on_watch_job_action(job_id: str, action: str) -> None:
+    """Callback from UpiWatchManager when Done/Fail is pressed in the browser."""
+    lm = get_link_manager()
+    job = lm.jobs.get(job_id)
+    if job is None:
+        return
+    import time as _time
+    if action == "done":
+        # Mark the job as having succeeded — user confirmed payment in browser
+        job.status = "success"
+        job.finished_at = _time.time()
+        if job.error:
+            job.error = None
+    elif action == "fail":
+        job.status = "error"
+        job.error = "Payment not completed (marked via Watch mode)"
+        job.finished_at = _time.time()
+    lm._broadcast_job(job)
+
+
+_watch_manager = UpiWatchManager(on_job_action=_on_watch_job_action)
+
+
+@app.post("/api/link/watch/start")
+async def watch_start(request: Request) -> JSONResponse:
+    """Start UPI Watch Mode for up to 3 India jobs.
+
+    Body: { slots: [{ slot_idx: 0|1|2, job_id, email, payment_url,
+                       publishable_key?, checkout_session_id? }] }
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(422, "Invalid JSON body")
+    configs: list[dict] = body.get("slots") or []
+    if not configs:
+        raise HTTPException(422, "slots list required")
+    result = await _watch_manager.start(configs)
+    return JSONResponse(result)
+
+
+@app.get("/api/link/watch/status")
+async def watch_status() -> JSONResponse:
+    return JSONResponse(_watch_manager.get_status())
+
+
+@app.post("/api/link/watch/slot/{slot_idx}/action")
+async def watch_slot_action(slot_idx: int, request: Request) -> JSONResponse:
+    """action: done | fail | off"""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(422, "Invalid JSON body")
+    action = body.get("action") or ""
+    if action not in ("done", "fail", "off"):
+        raise HTTPException(422, "action must be done|fail|off")
+    await _watch_manager.slot_action(slot_idx, action)
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/link/watch/stop-all")
+async def watch_stop_all() -> JSONResponse:
+    await _watch_manager.stop_all()
+    return JSONResponse({"ok": True})
+
+
+@app.get("/api/link/watch/slot/{slot_idx}/screenshot")
+async def watch_slot_screenshot(slot_idx: int):
+    """Return the latest screenshot for a watch slot as image/png."""
+    from fastapi.responses import FileResponse
+    p = _watch_manager.get_screenshot_path(slot_idx)
+    if p is None or not p.exists():
+        raise HTTPException(404, "No screenshot yet")
+    return FileResponse(str(p), media_type="image/png")
 
 
 # ─────────────────────────────────────────────────────────────────────

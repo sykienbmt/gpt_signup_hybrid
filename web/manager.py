@@ -1322,7 +1322,7 @@ def get_session_manager() -> SessionJobManager:
 # LinkJobManager — Get Link feature
 # ─────────────────────────────────────────────────────────────────────
 
-from ..payment_link import get_checkout_url, PaymentLinkError, REGION_BILLING, DEFAULT_REGION  # noqa: E402
+from ..payment_link import get_checkout_url, get_checkout_info, PaymentLinkError, REGION_BILLING, DEFAULT_REGION  # noqa: E402
 
 
 LinkMode = Literal["combo", "session_json", "access_token"]
@@ -1344,6 +1344,13 @@ class LinkJob:
     payment_link: str | None = None
     user_id: str | None = None
     screenshot_urls: list[str] = field(default_factory=list)
+    # Trial / payment data
+    is_trial: bool | None = None
+    trial_days: int = 0
+    amount_due: int = -1
+    currency: str = ""
+    checkout_session_id: str | None = None
+    publishable_key: str | None = None
     created_at: float = field(default_factory=time.time)
     started_at: float | None = None
     finished_at: float | None = None
@@ -1359,6 +1366,12 @@ class LinkJob:
             "payment_link": self.payment_link,
             "user_id": self.user_id,
             "screenshot_urls": list(self.screenshot_urls),
+            "is_trial": self.is_trial,
+            "trial_days": self.trial_days,
+            "amount_due": self.amount_due,
+            "currency": self.currency,
+            "checkout_session_id": self.checkout_session_id,
+            "publishable_key": self.publishable_key,
             "created_at": self.created_at,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
@@ -1905,15 +1918,24 @@ class LinkJobManager:
                     return
                 log(f"[token] using pre-provided token (mode={job.mode})")
 
-            # ── Get payment link ──
+            # ── Get payment link + trial info ──
             log(f"[link] fetching payment URL (region={job.region})")
             if self._proxy:
                 log(f"[link] via proxy {self._safe_proxy_log()}")
             try:
-                url = await asyncio.wait_for(
-                    get_checkout_url(access_token, region=job.region, proxy=self._proxy),
+                info = await asyncio.wait_for(
+                    get_checkout_info(access_token, region=job.region, proxy=self._proxy),
                     timeout=60.0,
                 )
+                url = info.payment_url
+                job.is_trial = info.is_trial
+                job.trial_days = info.trial_days
+                job.amount_due = info.amount_due
+                job.currency = info.currency
+                job.checkout_session_id = info.checkout_session_id
+                job.publishable_key = info.publishable_key
+                trial_str = f"trial={info.trial_days}d" if info.is_trial else f"paid={info.amount_due}"
+                log(f"[link] trial_check: {trial_str}")
             except asyncio.TimeoutError:
                 job.status = "error"
                 job.error = "payment_link: timeout 60s exceeded"

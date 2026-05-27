@@ -26,6 +26,15 @@
     region: 'VN',
     upiInProgress: new Set(),
     upiDone: new Set(),
+    // UPI payment polling: jobId → intervalId (null = stopped)
+    upiPolling: new Map(),
+    upiPaid: new Set(),
+    // Watch mode
+    watch: {
+      active: false,
+      slots: [],         // [{slot_idx, job_id, email, status, status_msg, has_screenshot, screenshot_ts}]
+      pollInterval: null,
+    },
   };
 
   const $ = (id) => document.getElementById(id);
@@ -38,6 +47,7 @@
     btnClearDone: $('link-btn-clear-done'),
     btnClearAll: $('link-btn-clear-all'),
     btnCopyError: $('link-btn-copy-error'),
+    btnWatch: $('link-btn-watch'),
     comboCount: $('link-combo-count'),
     jobTimeout: $('link-job-timeout'),
     regionSelect: $('link-region-select'),
@@ -46,6 +56,14 @@
     logPane: $('link-log-pane'),
     logTarget: $('link-log-target'),
     errorPane: $('link-error-pane'),
+    watchPanel: $('link-watch-panel'),
+    watchSlots: $('link-watch-slots'),
+    watchStopAll: $('link-watch-stop-all'),
+    watchClose: $('link-watch-close'),
+    watchPicker: $('link-watch-picker'),
+    watchPickerList: $('link-watch-picker-list'),
+    watchPickerStart: $('link-watch-picker-start'),
+    watchPickerCancel: $('link-watch-picker-cancel'),
   };
 
   // ─── Mode switching ───
@@ -140,24 +158,46 @@
       stats[job.status] = (stats[job.status] || 0) + 1;
       const cls = state.activeJobId === id ? 'job is-active' : 'job';
 
+      const isTrial = job.is_trial === true;
+      const isPaid  = job.is_trial === false;
+      const upiPaid = state.upiPaid.has(id);
+      const isPolling = state.upiPolling.has(id);
+
       const actions = [];
       if (job.payment_link) {
         actions.push(
           `<button class="icon-btn" data-action="copy-link" data-id="${escHtml(id)}" title="Copy payment link">${window.GptUi.icon('link')}</button>`,
-          `<a class="icon-btn" href="${escHtml(job.payment_link)}" target="_blank" rel="noopener noreferrer" title="Open payment link">🔗</a>`,
         );
-        if (job.region === 'IN') {
-          const upiBusy = state.upiInProgress.has(id);
-          const upiDone = state.upiDone.has(id);
-          let upiLabel;
-          if (upiBusy) upiLabel = '<span class="upi-spinner"></span>';
-          else if (upiDone) upiLabel = '✅';
-          else upiLabel = '🇮🇳 UPI';
-          const upiAttrs = upiBusy ? 'disabled' : '';
-          const upiTitle = upiDone ? 'UPI filled — click to re-run' : 'Auto fill UPI &amp; subscribe';
+        // Trial: only copy + delete; no UPI, no open-link action buttons
+        if (!isTrial) {
           actions.push(
-            `<button class="icon-btn upi-btn" data-action="upi-fill" data-id="${escHtml(id)}" title="${upiTitle}" ${upiAttrs}>${upiLabel}</button>`,
+            `<a class="icon-btn" href="${escHtml(job.payment_link)}" target="_blank" rel="noopener noreferrer" title="Open payment link">🔗</a>`,
           );
+          if (job.region === 'IN' && !upiPaid) {
+            const upiBusy = state.upiInProgress.has(id);
+            const upiDone = state.upiDone.has(id);
+            let upiLabel;
+            if (upiBusy) upiLabel = '<span class="upi-spinner"></span>';
+            else if (upiDone) upiLabel = '✅';
+            else upiLabel = '🇮🇳 UPI';
+            const upiAttrs = upiBusy ? 'disabled' : '';
+            const upiTitle = upiDone ? 'UPI filled — click to re-run' : 'Auto fill UPI &amp; subscribe';
+            actions.push(
+              `<button class="icon-btn upi-btn" data-action="upi-fill" data-id="${escHtml(id)}" title="${upiTitle}" ${upiAttrs}>${upiLabel}</button>`,
+            );
+          }
+          // UPI polling controls (only after upiDone and not yet paid)
+          if (state.upiDone.has(id) && !upiPaid) {
+            if (isPolling) {
+              actions.push(
+                `<button class="icon-btn" data-action="upi-stop-poll" data-id="${escHtml(id)}" title="Stop watching payment" style="color:var(--red)">⏹</button>`,
+              );
+            } else {
+              actions.push(
+                `<button class="icon-btn" data-action="upi-start-poll" data-id="${escHtml(id)}" title="Watch for payment">👁</button>`,
+              );
+            }
+          }
         }
       }
       if (job.status === 'running') {
@@ -173,8 +213,28 @@
         `<button class="icon-btn icon-danger" data-action="remove" data-id="${escHtml(id)}" title="Remove">${window.GptUi.icon('remove')}</button>`,
       );
 
+      // Trial / paid badge
+      let trialBadge = '';
+      if (upiPaid) {
+        trialBadge = `<span style="color:var(--green);font-weight:700;font-size:11px">💸 PAID</span>`;
+      } else if (isTrial) {
+        const days = job.trial_days ? ` (${job.trial_days}d)` : '';
+        trialBadge = `<span style="color:var(--green);font-weight:700;font-size:11px">✅ FREE Trial${days}</span>`;
+      } else if (isPaid && job.amount_due >= 0) {
+        const amt = (job.amount_due / 100).toFixed(2);
+        trialBadge = `<span style="color:var(--red);font-weight:600;font-size:11px">💳 ${escHtml(amt)} ${escHtml(job.currency)}</span>`;
+      } else if (isPolling) {
+        trialBadge = `<span style="color:var(--blue);font-size:11px">👁 Watching…</span>`;
+      }
+
+      // Border color based on trial status
+      let borderStyle = '';
+      if (upiPaid) borderStyle = 'border-left:3px solid var(--green)';
+      else if (isTrial) borderStyle = 'border-left:3px solid var(--green)';
+      else if (isPaid) borderStyle = '';
+
       const meta = job.payment_link
-        ? `<div class="job-meta" title="${escHtml(job.payment_link)}">${escHtml(job.payment_link)}</div>`
+        ? `<div class="job-meta" title="${escHtml(job.payment_link)}">${trialBadge ? trialBadge + ' · ' : ''}${escHtml(job.payment_link)}</div>`
         : '';
 
       const shots = (job.screenshot_urls && job.screenshot_urls.length)
@@ -186,7 +246,7 @@
       const modeTag = job.mode && job.mode !== 'combo' ? `<span class="muted">[${escHtml(job.mode)}]</span> ` : '';
 
       return `
-        <div class="${cls}" data-id="${escHtml(id)}">
+        <div class="${cls}" data-id="${escHtml(id)}"${borderStyle ? ` style="${borderStyle}"` : ''}>
           <div class="job-index">${idx + 1}</div>
           <div class="job-status status-${escHtml(job.status)}">${escHtml(job.status)}</div>
           <div class="job-main">
@@ -261,6 +321,215 @@
     if (state.activeJobId !== jobId) return;
     dom.logPane.textContent += `${line}\n`;
     dom.logPane.scrollTop = dom.logPane.scrollHeight;
+  }
+
+  // ─── Watch Mode ───────────────────────────────────────────────────────────
+
+  const WATCH_STATUS_LABEL = {
+    idle: '⏳ Idle', opening: '🔄 Opening browser…', navigating: '🌐 Navigating…',
+    filling: '📝 Filling billing…', submitting: '🚀 Submitting…',
+    waiting_qr: '⏳ Waiting for QR…', qr_visible: '📱 QR visible',
+    done: '✅ Paid', failed: '❌ Failed', off: '🔴 Closed', error: '⚠ Error',
+  };
+  const WATCH_STATUS_COLOR = {
+    qr_visible: 'var(--blue)', done: 'var(--green)', failed: 'var(--red)',
+    error: 'var(--red)', off: 'var(--muted)',
+  };
+
+  function renderWatchPanel() {
+    const { active, slots } = state.watch;
+    dom.watchPanel.style.display = active ? '' : 'none';
+    if (!active) return;
+
+    dom.watchSlots.innerHTML = slots.map((s) => {
+      const color = WATCH_STATUS_COLOR[s.status] || 'var(--fg)';
+      const label = WATCH_STATUS_LABEL[s.status] || s.status;
+      const isDone = ['done', 'failed', 'off'].includes(s.status);
+      const shotUrl = s.has_screenshot
+        ? `/api/link/watch/slot/${s.slot_idx}/screenshot?t=${s.screenshot_ts}`
+        : '';
+      const actionBtns = isDone ? '' : `
+        <div class="watch-slot-actions">
+          <button class="btn btn-ghost btn-small" data-watch-action="done" data-slot="${s.slot_idx}">✅ Done</button>
+          <button class="btn btn-ghost btn-small" data-watch-action="fail" data-slot="${s.slot_idx}">❌ Fail</button>
+          <button class="btn btn-ghost btn-small" data-watch-action="off"  data-slot="${s.slot_idx}">🔴 Off</button>
+        </div>`;
+      return `<div class="watch-slot">
+        <div class="watch-slot-header">
+          <span class="watch-slot-idx">${s.slot_idx + 1}</span>
+          <span class="watch-slot-email" title="${escHtml(s.email)}">${escHtml(s.email)}</span>
+          <span class="watch-slot-status" style="color:${color}">${label}</span>
+        </div>
+        <div class="watch-slot-msg muted">${escHtml(s.status_msg)}</div>
+        ${shotUrl ? `<img class="watch-slot-shot" src="${escHtml(shotUrl)}" alt="screenshot">` : '<div class="watch-slot-no-shot muted">No screenshot yet</div>'}
+        ${actionBtns}
+      </div>`;
+    }).join('');
+  }
+
+  async function pollWatchStatus() {
+    try {
+      const data = await api('/api/link/watch/status');
+      state.watch.slots = data.slots || [];
+      renderWatchPanel();
+    } catch (err) {
+      console.error('[watch poll]', err.message);
+    }
+  }
+
+  function startWatchPolling() {
+    if (state.watch.pollInterval) return;
+    state.watch.pollInterval = setInterval(pollWatchStatus, 3000);
+  }
+
+  function stopWatchPolling() {
+    if (state.watch.pollInterval) {
+      clearInterval(state.watch.pollInterval);
+      state.watch.pollInterval = null;
+    }
+  }
+
+  function openWatchPicker() {
+    // Collect eligible India jobs with a payment link
+    const eligible = state.order
+      .map((id) => state.jobs.get(id))
+      .filter((j) => j && j.status === 'success' && j.payment_link && j.region === 'IN');
+
+    if (!eligible.length) {
+      alert('No India jobs with payment links available. Get links for India region first.');
+      return;
+    }
+
+    dom.watchPickerList.innerHTML = eligible.map((j, i) => `
+      <label class="watch-picker-row">
+        <input type="checkbox" class="watch-picker-cb" value="${escHtml(j.id)}" data-idx="${i}" ${i < 3 ? 'checked' : ''}>
+        <span>${escHtml(j.email)}</span>
+        <span class="muted" style="font-size:11px">${escHtml((j.payment_link || '').slice(0, 48))}…</span>
+      </label>
+    `).join('');
+
+    // Enforce max 3 checkboxes
+    dom.watchPickerList.querySelectorAll('.watch-picker-cb').forEach((cb) => {
+      cb.addEventListener('change', () => {
+        const checked = dom.watchPickerList.querySelectorAll('.watch-picker-cb:checked');
+        if (checked.length > 3) cb.checked = false;
+      });
+    });
+
+    dom.watchPicker.style.display = '';
+  }
+
+  dom.btnWatch.addEventListener('click', openWatchPicker);
+
+  dom.watchPickerCancel.addEventListener('click', () => {
+    dom.watchPicker.style.display = 'none';
+  });
+
+  dom.watchPickerStart.addEventListener('click', async () => {
+    const checked = [...dom.watchPickerList.querySelectorAll('.watch-picker-cb:checked')];
+    if (!checked.length) { alert('Select at least one account.'); return; }
+
+    const slots = checked.slice(0, 3).map((cb, i) => {
+      const jobId = cb.value;
+      const job = state.jobs.get(jobId);
+      return {
+        slot_idx: i,
+        job_id: jobId,
+        email: job?.email || '',
+        payment_url: job?.payment_link || '',
+        publishable_key: job?.publishable_key || null,
+        checkout_session_id: job?.checkout_session_id || null,
+      };
+    });
+
+    dom.watchPicker.style.display = 'none';
+    dom.watchPickerStart.disabled = true;
+
+    try {
+      const data = await api('/api/link/watch/start', {
+        method: 'POST',
+        body: JSON.stringify({ slots }),
+      });
+      state.watch.active = true;
+      state.watch.slots = data.slots || [];
+      renderWatchPanel();
+      startWatchPolling();
+    } catch (err) {
+      alert('Watch start failed: ' + err.message);
+    } finally {
+      dom.watchPickerStart.disabled = false;
+    }
+  });
+
+  dom.watchStopAll.addEventListener('click', async () => {
+    try {
+      await api('/api/link/watch/stop-all', { method: 'POST' });
+      await pollWatchStatus();
+    } catch (err) {
+      console.error(err);
+    }
+  });
+
+  dom.watchClose.addEventListener('click', () => {
+    stopWatchPolling();
+    state.watch.active = false;
+    renderWatchPanel();
+  });
+
+  // Watch slot action buttons (event delegation on watch slots container)
+  dom.watchSlots.addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-watch-action]');
+    if (!btn) return;
+    const action = btn.dataset.watchAction;
+    const slotIdx = parseInt(btn.dataset.slot, 10);
+    btn.disabled = true;
+    try {
+      await api(`/api/link/watch/slot/${slotIdx}/action`, {
+        method: 'POST',
+        body: JSON.stringify({ action }),
+      });
+      await pollWatchStatus();
+    } catch (err) {
+      alert('Action failed: ' + err.message);
+      btn.disabled = false;
+    }
+  });
+
+  // ─── UPI payment polling ───
+  function startUpiPolling(jobId) {
+    if (state.upiPolling.has(jobId)) return;
+    const job = state.jobs.get(jobId);
+    if (!job || !job.checkout_session_id || !job.publishable_key) {
+      alert('Không có Stripe session ID để poll. Hãy thử lại lấy link.');
+      return;
+    }
+    const intervalId = setInterval(async () => {
+      try {
+        const data = await api('/api/stripe/poll-paid', {
+          method: 'POST',
+          body: JSON.stringify({
+            session_id: job.checkout_session_id,
+            publishable_key: job.publishable_key,
+          }),
+        });
+        if (data.paid) {
+          stopUpiPolling(jobId);
+          state.upiPaid.add(jobId);
+          renderJobs();
+        }
+      } catch (err) {
+        console.error('[upi-poll] error:', err.message);
+      }
+    }, 5000);
+    state.upiPolling.set(jobId, intervalId);
+    renderJobs();
+  }
+
+  function stopUpiPolling(jobId) {
+    const intervalId = state.upiPolling.get(jobId);
+    if (intervalId != null) clearInterval(intervalId);
+    state.upiPolling.delete(jobId);
+    renderJobs();
   }
 
   function connectSSE() {
@@ -346,6 +615,10 @@
             state.upiInProgress.delete(id);
             renderJobs();
           });
+      } else if (action === 'upi-start-poll') {
+        startUpiPolling(id);
+      } else if (action === 'upi-stop-poll') {
+        stopUpiPolling(id);
       } else if (action === 'retry') {
         api(`/api/link/jobs/${id}/retry`, { method: 'POST' }).catch((err) => alert(err.message));
       } else if (action === 'stop' || action === 'remove') {

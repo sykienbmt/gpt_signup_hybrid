@@ -59,6 +59,20 @@ class CheckoutResponse:
     checkout_ui_mode: str | None = None
 
 
+@dataclass
+class CheckoutInfo:
+    """Rich result from get_checkout_info() — URL + trial data + Stripe IDs."""
+
+    payment_url: str
+    checkout_session_id: str
+    publishable_key: str
+    is_trial: bool
+    trial_days: int
+    amount_due: int          # smallest currency unit; -1 if unknown
+    currency: str
+    payment_intent_id: str | None = None   # pi_xxx (for polling)
+
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -318,3 +332,136 @@ async def get_checkout_url(
             timeout=timeout,
         )
         return _replace_stripe_host(hosted_url)
+
+
+def _stripe_init_form(publishable_key: str) -> dict[str, str]:
+    """Minimal Stripe payment_pages/init form data (no elements_options_client)."""
+    return {
+        "browser_locale": "en-US",
+        "browser_timezone": "Asia/Saigon",
+        "elements_session_client[client_betas][0]": "custom_checkout_server_updates_1",
+        "elements_session_client[client_betas][1]": "custom_checkout_manual_approval_1",
+        "elements_session_client[elements_init_source]": "custom_checkout",
+        "elements_session_client[referrer_host]": "chatgpt.com",
+        "elements_session_client[stripe_js_id]": str(uuid.uuid4()),
+        "elements_session_client[locale]": "en-US",
+        "elements_session_client[is_aggregation_expected]": "false",
+        "key": publishable_key,
+        "_stripe_version": "2025-03-31.basil; checkout_server_update_beta=v1; checkout_manual_approval_preview=v1",
+    }
+
+
+_STRIPE_INIT_HEADERS = {
+    "Content-Type": "application/x-www-form-urlencoded",
+    "Accept": "application/json",
+    "Origin": "https://js.stripe.com",
+    "Referer": "https://js.stripe.com/",
+}
+
+
+async def _call_stripe_init_full(
+    session: AsyncSession,
+    checkout_session_id: str,
+    publishable_key: str,
+    *,
+    timeout: float = 30.0,
+) -> dict:
+    """Like _call_stripe_init but returns the full JSON response dict."""
+    url = _STRIPE_INIT_URL_TPL.format(session_id=checkout_session_id)
+    resp = await session.post(
+        url,
+        headers=_STRIPE_INIT_HEADERS,
+        data=_stripe_init_form(publishable_key),
+        timeout=timeout,
+    )
+    if resp.status_code != 200:
+        raise StripeInitError(f"HTTP {resp.status_code}: {resp.text[:300]}")
+    try:
+        return resp.json()
+    except Exception as exc:
+        raise StripeInitError(f"JSON parse error: {exc}") from exc
+
+
+def _parse_stripe_trial(data: dict) -> tuple[bool, int, int, str]:
+    """Parse (is_trial, trial_days, amount_due, currency) from Stripe init response."""
+    amount_due: int = (data.get("invoice") or {}).get("amount_due", -1)
+    trial_days: int = (data.get("subscription_data") or {}).get("trial_period_days") or 0
+    is_trial = amount_due == 0 or trial_days > 0
+    currency = data.get("currency", "").upper()
+    return is_trial, trial_days, amount_due, currency
+
+
+async def get_checkout_info(
+    access_token: str,
+    *,
+    region: str = DEFAULT_REGION,
+    proxy: str | None = None,
+    timeout: float = 30.0,
+) -> CheckoutInfo:
+    """Like get_checkout_url() but returns CheckoutInfo with trial data.
+
+    Raises same errors as get_checkout_url().
+    """
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+
+    async with AsyncSession(impersonate=_IMPERSONATE, proxies=proxies) as session:
+        checkout = await _call_chatgpt_checkout(
+            session, access_token, region=region, timeout=timeout,
+        )
+
+        # Payment URL — prefer checkout.url when it has /c/pay/
+        payment_url = ""
+        if checkout.url:
+            replaced = _replace_stripe_host(checkout.url)
+            if "/c/pay/" in (urlparse(replaced).path or ""):
+                payment_url = replaced
+
+        # Call Stripe init for full data (trial, amount, payment_intent)
+        try:
+            stripe_data = await _call_stripe_init_full(
+                session,
+                checkout.checkout_session_id,
+                checkout.publishable_key,
+                timeout=timeout,
+            )
+        except StripeInitError:
+            # Fallback: use checkout.url or _call_stripe_init for URL only
+            if not payment_url:
+                hosted = await _call_stripe_init(
+                    session,
+                    checkout.checkout_session_id,
+                    checkout.publishable_key,
+                    timeout=timeout,
+                )
+                payment_url = _replace_stripe_host(hosted)
+            return CheckoutInfo(
+                payment_url=payment_url,
+                checkout_session_id=checkout.checkout_session_id,
+                publishable_key=checkout.publishable_key,
+                is_trial=False,
+                trial_days=0,
+                amount_due=-1,
+                currency="",
+            )
+
+        # Extract payment URL if not yet found
+        if not payment_url:
+            hosted = stripe_data.get("stripe_hosted_url") or ""
+            payment_url = _replace_stripe_host(hosted) if hosted else ""
+
+        is_trial, trial_days, amount_due, currency = _parse_stripe_trial(stripe_data)
+
+        # Payment intent ID (for polling)
+        pi = stripe_data.get("payment_intent") or {}
+        payment_intent_id = pi.get("id") or None
+
+        return CheckoutInfo(
+            payment_url=payment_url,
+            checkout_session_id=checkout.checkout_session_id,
+            publishable_key=checkout.publishable_key,
+            is_trial=is_trial,
+            trial_days=trial_days,
+            amount_due=amount_due,
+            currency=currency,
+            payment_intent_id=payment_intent_id,
+        )

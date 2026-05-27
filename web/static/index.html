@@ -270,6 +270,7 @@
     <header class="card-head">
       <h2>Jobs</h2>
       <div class="card-head-actions">
+        <button id="link-btn-watch" class="btn btn-ghost btn-small" title="Open Watch Mode for India UPI jobs">🔭 Watch</button>
         <button id="link-btn-clear-done" class="btn btn-ghost btn-small">Clear Done</button>
         <button id="link-btn-clear-all" class="btn btn-danger btn-small" title="Cancel running jobs and remove all from memory">Clear All</button>
         <span class="muted" id="link-job-summary">0 total</span>
@@ -295,6 +296,30 @@
     </header>
     <pre id="link-error-pane" class="output-pane">No errors yet.</pre>
   </section>
+
+  <!-- Watch Mode Panel -->
+  <section class="card card-span-full" id="link-watch-panel" style="display:none">
+    <header class="card-head">
+      <h2>🔭 Watch Mode <span class="muted" style="font-weight:400;font-size:12px">— UPI India live monitor</span></h2>
+      <div class="card-head-actions">
+        <button id="link-watch-stop-all" class="btn btn-danger btn-small">⏹ Stop All</button>
+        <button id="link-watch-close" class="btn btn-ghost btn-small">✕ Close</button>
+      </div>
+    </header>
+    <div id="link-watch-slots" class="watch-slots"></div>
+  </section>
+
+  <!-- Watch Mode: Job Selector -->
+  <div id="link-watch-picker" class="watch-picker" style="display:none">
+    <div class="watch-picker-inner">
+      <h3>Select accounts to watch <span class="muted">(max 3, India only)</span></h3>
+      <div id="link-watch-picker-list" class="watch-picker-list"></div>
+      <div class="watch-picker-actions">
+        <button id="link-watch-picker-start" class="btn btn-primary">🔭 Start Watch</button>
+        <button id="link-watch-picker-cancel" class="btn btn-ghost">Cancel</button>
+      </div>
+    </div>
+  </div>
 </main>
 
 <!-- ════════════════ TAB: CHECK ACCOUNT ════════════════ -->
@@ -359,6 +384,15 @@
           <option value="US">🇺🇸 US (USD)</option>
         </select>
       </label>
+      <label class="select-wrap">
+        <span class="muted" style="font-size:11px;margin-right:4px">Parallel</span>
+        <select id="cp-parallel">
+          <option value="1">1</option>
+          <option value="5">5</option>
+          <option value="10" selected>10</option>
+          <option value="20">20</option>
+        </select>
+      </label>
       <button id="cp-btn-run" class="btn btn-primary">▶ Check</button>
     </div>
   </section>
@@ -367,6 +401,7 @@
     <header class="card-head">
       <h2>Results</h2>
       <span class="muted" id="cp-summary"></span>
+      <button id="cp-btn-clear-results" class="btn btn-ghost btn-small" style="margin-left:8px">Clear</button>
     </header>
     <div id="cp-result-list" class="job-list" style="flex:1;min-height:0;padding:4px 6px">
       <div class="empty">Paste sessions and click Check.</div>
