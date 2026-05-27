@@ -776,6 +776,11 @@ body {
   text-overflow: ellipsis;
 }
 
+.job-selected {
+  background: color-mix(in srgb, var(--accent) 8%, transparent) !important;
+  outline: 1px solid var(--accent);
+}
+
 .shot-copy-btn {
   background: none;
   border: none;

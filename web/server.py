@@ -926,6 +926,175 @@ async def check_account_run(payload: CheckAccountRequest) -> JSONResponse:
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Check Payment
+# ─────────────────────────────────────────────────────────────────────
+
+
+@app.post("/api/check-payment")
+async def check_payment_sessions(request: Request) -> JSONResponse:
+    """Check sessions for payment status via OpenAI checkout + Stripe init APIs.
+
+    Body: { sessions: [{token, email?}], region: "VN" }
+    Flow per session:
+      1. POST chatgpt.com checkout → checkout_session_id + publishable_key
+      2. POST api.stripe.com init → full Stripe data (hosted_url + invoice)
+      3. Parse amount_due / trial_period_days → is_free
+    """
+    import uuid as _uuid
+
+    from ..payment_link import (
+        _call_chatgpt_checkout,
+        _replace_stripe_host,
+        REGION_BILLING,
+        DEFAULT_REGION,
+        PaymentLinkError,
+        SessionExpiredError,
+        CloudflareBlockedError,
+    )
+    from curl_cffi.requests import AsyncSession as CurlSession
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="Invalid JSON body")
+
+    sessions_input: list[dict] = body.get("sessions") or []
+    region: str = body.get("region") or DEFAULT_REGION
+    if region not in REGION_BILLING:
+        region = DEFAULT_REGION
+
+    results: list[dict] = []
+
+    for item in sessions_input:
+        token = (item.get("token") or "").strip()
+        hint_email = (item.get("email") or "").strip()
+        logs: list[str] = []
+
+        if not token:
+            results.append({"error": "Missing accessToken", "email": hint_email, "logs": logs})
+            continue
+
+        try:
+            async with CurlSession(impersonate="chrome136") as curl_session:
+                logs.append(f"→ Calling OpenAI checkout API (region={region})…")
+                checkout = await _call_chatgpt_checkout(
+                    curl_session, token, region=region, timeout=30.0,
+                )
+                logs.append(f"✓ Got checkout_session_id: {checkout.checkout_session_id[:24]}…")
+
+                # Use checkout.url if already available (hosted mode returns it directly)
+                payment_url = ""
+                if checkout.url:
+                    payment_url = _replace_stripe_host(checkout.url)
+                    logs.append(f"✓ Payment URL from checkout response")
+
+                # Call Stripe payment_pages init to get invoice/trial data
+                logs.append("→ Calling Stripe payment_pages init…")
+                stripe_js_id = str(_uuid.uuid4())
+                stripe_init_url = f"https://api.stripe.com/v1/payment_pages/{checkout.checkout_session_id}/init"
+                form_data = {
+                    "browser_locale": "en-US",
+                    "browser_timezone": "Asia/Saigon",
+                    "elements_session_client[client_betas][0]": "custom_checkout_server_updates_1",
+                    "elements_session_client[client_betas][1]": "custom_checkout_manual_approval_1",
+                    "elements_session_client[elements_init_source]": "custom_checkout",
+                    "elements_session_client[referrer_host]": "chatgpt.com",
+                    "elements_session_client[stripe_js_id]": stripe_js_id,
+                    "elements_session_client[locale]": "en-US",
+                    "elements_session_client[is_aggregation_expected]": "false",
+                    "key": checkout.publishable_key,
+                    "_stripe_version": "2025-03-31.basil; checkout_server_update_beta=v1; checkout_manual_approval_preview=v1",
+                }
+                stripe_resp = await curl_session.post(
+                    stripe_init_url,
+                    headers={
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "Accept": "application/json",
+                        "Origin": "https://js.stripe.com",
+                        "Referer": "https://js.stripe.com/",
+                    },
+                    data=form_data,
+                    timeout=30.0,
+                )
+
+                if stripe_resp.status_code != 200:
+                    err_body = stripe_resp.text[:400]
+                    logs.append(f"✗ Stripe init HTTP {stripe_resp.status_code}: {err_body}")
+                    # Still usable if we have payment_url from checkout
+                    if payment_url:
+                        logs.append("⚠ Using payment URL from checkout (Stripe data unavailable)")
+                        results.append({
+                            "email": hint_email,
+                            "is_free": None,
+                            "amount_due": -1,
+                            "currency": "",
+                            "trial_days": 0,
+                            "product": "",
+                            "payment_url": payment_url,
+                            "session_id": checkout.checkout_session_id,
+                            "error": f"Stripe init HTTP {stripe_resp.status_code} — trial status unknown",
+                            "logs": logs,
+                        })
+                    else:
+                        results.append({
+                            "email": hint_email,
+                            "error": f"Stripe init failed: HTTP {stripe_resp.status_code}",
+                            "logs": logs,
+                        })
+                    continue
+
+                stripe_data: dict = stripe_resp.json()
+                logs.append("✓ Stripe init OK")
+
+                # Use stripe_hosted_url if checkout.url was missing
+                if not payment_url:
+                    hosted = stripe_data.get("stripe_hosted_url") or ""
+                    payment_url = _replace_stripe_host(hosted) if hosted else ""
+
+                amount_due = (stripe_data.get("invoice") or {}).get("amount_due", -1)
+                trial_days = (stripe_data.get("subscription_data") or {}).get("trial_period_days") or 0
+                is_free = amount_due == 0 or trial_days > 0
+                currency = stripe_data.get("currency", "").upper()
+                email = (
+                    (stripe_data.get("customer") or {}).get("email")
+                    or stripe_data.get("customer_email")
+                    or hint_email
+                )
+                lines_data = ((stripe_data.get("invoice") or {}).get("lines") or {}).get("data") or []
+                product = lines_data[0].get("description", "") if lines_data else ""
+
+                status_str = "FREE ✅" if is_free else f"PAID 💳 {amount_due / 100:.2f} {currency}"
+                logs.append(f"→ Result: {status_str} | email={email} | product={product}")
+
+                results.append({
+                    "email": email,
+                    "is_free": is_free,
+                    "amount_due": amount_due,
+                    "currency": currency,
+                    "trial_days": trial_days,
+                    "product": product,
+                    "payment_url": payment_url,
+                    "session_id": checkout.checkout_session_id,
+                    "logs": logs,
+                })
+
+        except SessionExpiredError as e:
+            logs.append(f"✗ Session expired: {e}")
+            results.append({"email": hint_email, "error": f"Session expired — token invalid or revoked", "logs": logs})
+        except CloudflareBlockedError as e:
+            logs.append(f"✗ Cloudflare blocked: {e}")
+            results.append({"email": hint_email, "error": "Cloudflare blocked the request", "logs": logs})
+        except PaymentLinkError as e:
+            logs.append(f"✗ {e}")
+            results.append({"email": hint_email, "error": str(e), "logs": logs})
+        except Exception as e:
+            logs.append(f"✗ Unexpected error: {e}")
+            results.append({"email": hint_email, "error": str(e), "logs": logs})
+
+    return JSONResponse({"results": results})
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Static UI
 # ─────────────────────────────────────────────────────────────────────
 
