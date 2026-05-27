@@ -82,7 +82,7 @@
       </label>
       <div id="mail-mode-config-host" class="mail-mode-config-host"></div>
     </div>
-    <textarea class="combo-textarea" id="combo-input" placeholder="email1@hotmail.com|pwd1|M.C548...|9e5f94bc-...&#10;email2@outlook.com|pwd2|M.C525...|9e5f94bc-..."></textarea>
+    <textarea class="combo-textarea combo-textarea-nowrap" id="combo-input" wrap="off" spellcheck="false" placeholder="email1@hotmail.com|pwd1|M.C548...|9e5f94bc-...&#10;email2@outlook.com|pwd2|M.C525...|9e5f94bc-..."></textarea>
     <div class="card-settings">
       <div class="card-settings-row card-settings-row-mixed">
         <label class="input-group config-field-long">
@@ -239,7 +239,7 @@
       </div>
     </header>
     <span class="muted card-head-note" id="link-mode-hint">One line per combo: email|password|2fa_secret</span>
-    <textarea class="combo-textarea" id="link-combo-input" placeholder="email@hotmail.com|password123|DNPARKKMM5EYOPDG...&#10;email2@outlook.com|pass456|I77PEBZQNEBE67SU..." maxlength="50000"></textarea>
+    <textarea class="combo-textarea combo-textarea-nowrap" id="link-combo-input" wrap="off" spellcheck="false" placeholder="email@hotmail.com|password123|DNPARKKMM5EYOPDG...&#10;email2@outlook.com|pass456|I77PEBZQNEBE67SU..."></textarea>
     <div class="card-settings">
       <div class="card-settings-row card-settings-row-mixed">
         <label class="input-group config-field-short">
@@ -248,6 +248,7 @@
             <option value="VN">🇻🇳 Vietnam (VND)</option>
             <option value="ID">🇮🇩 Indonesia (IDR)</option>
             <option value="IN">🇮🇳 India (INR)</option>
+            <option value="BR">🇧🇷 Brazil (BRL)</option>
             <option value="US">🇺🇸 US (USD)</option>
           </select>
         </label>

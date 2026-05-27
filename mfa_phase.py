@@ -29,6 +29,11 @@ _HTTP_TIMEOUT = 60.0
 _MAX_ATTEMPTS = 4
 _BACKOFF_SECONDS = (3.0, 6.0, 10.0)  # delay sau attempt 1, 2, 3
 
+# Account mới đôi khi chưa provision xong organization/workspace → enroll trả
+# 401 no_organization. Đợi rồi retry; nếu vẫn lỗi → account bad, skip.
+_NO_ORG_RETRIES = 2
+_NO_ORG_DELAY_SECONDS = 6.0
+
 
 class MfaError(Exception):
     """MFA enable fail."""
@@ -137,6 +142,24 @@ def _enroll_totp(session, *, access_token: str, cookies: list[dict[str, Any]] | 
                 )
             else:
                 raise MfaError(f"enroll failed HTTP 401 + refresh failed: {body_text}")
+
+    # 401 no_organization → account chưa provision org xong. Đợi rồi retry.
+    no_org_attempt = 0
+    while (
+        r.status_code == 401
+        and "no_organization" in r.text
+        and no_org_attempt < _NO_ORG_RETRIES
+    ):
+        no_org_attempt += 1
+        log(
+            f"[mfa] no_organization — account chưa có org, đợi "
+            f"{_NO_ORG_DELAY_SECONDS:.0f}s rồi retry ({no_org_attempt}/{_NO_ORG_RETRIES})"
+        )
+        time.sleep(_NO_ORG_DELAY_SECONDS)
+        r = _post_with_retry(
+            session, url=url, headers=headers, body={"factor_type": "totp"},
+            log=log, label=f"enroll-no-org-retry-{no_org_attempt}",
+        )
 
     if r.status_code != 200:
         raise MfaError(f"enroll failed HTTP {r.status_code}: {r.text[:300]}")
