@@ -61,50 +61,51 @@
   }
   dom.input.addEventListener('input', updateCount);
 
-  // ── Render one card ───────────────────────────────────────────────────
+  // ── Render one compact card ───────────────────────────────────────────
   function renderCard(i) {
     const r = _results[i];
     const s = _sessions[i];
+    const email = (r && r.email) || s.email || `#${i + 1}`;
+
+    const copyEmailBtn = `<button class="icon-btn" onclick="event.stopPropagation();window.GptUi.copyText(${JSON.stringify(email)})" title="Copy email">📧</button>`;
+    const logBtn = `<button class="icon-btn cp-log-btn" data-idx="${i}" title="Show log">📋</button>`;
 
     // Still checking
     if (r === null) {
-      return `<div class="job cp-result-item" data-idx="${i}" style="border-left:3px solid var(--muted,#888);cursor:pointer">
+      return `<div class="job-compact cp-result-item" data-idx="${i}" style="border-left:3px solid var(--border)">
         <div class="job-index">${i + 1}</div>
         <div class="job-status status-running">…</div>
-        <div class="job-main">
-          <div class="job-email">${escHtml(s.email || `Session ${i + 1}`)}</div>
-          <div class="job-meta muted">Checking…</div>
+        <div class="job-compact-main">
+          <span class="job-compact-email muted">${escHtml(s.email || `Session ${i + 1}`)}</span>
         </div>
+        <div class="job-compact-actions"></div>
       </div>`;
     }
 
-    const logBtn = `<button class="icon-btn cp-log-btn" data-idx="${i}" title="Show log" style="font-size:13px">📋</button>`;
-
-    // Partial result: has payment URL but Stripe data unavailable
+    // Partial: has URL but Stripe data missing
     if (r.error && r.payment_url) {
-      const linkBtn = `<button class="icon-btn" onclick="event.stopPropagation();window.GptUi.copyText(${JSON.stringify(r.payment_url)})" title="Copy payment link">🔗</button>`;
-      return `<div class="job cp-result-item" data-idx="${i}" style="border-left:3px solid #f5a623;cursor:pointer">
+      const linkBtn = `<button class="icon-btn" onclick="event.stopPropagation();window.GptUi.copyText(${JSON.stringify(r.payment_url)})" title="Copy link">🔗</button>`;
+      return `<div class="job-compact cp-result-item" data-idx="${i}" style="border-left:3px solid #f5a623">
         <div class="job-index">${i + 1}</div>
         <div class="job-status status-running">?</div>
-        <div class="job-main">
-          <div class="job-email">${escHtml(r.email || s.email || '—')}</div>
-          <div class="job-meta" style="color:#f5a623">⚠ ${escHtml(r.error)}</div>
-          <div class="job-meta muted" style="font-size:10px;word-break:break-all">${escHtml(r.payment_url)}</div>
+        <div class="job-compact-main">
+          <span class="job-compact-email">${escHtml(email)}</span>
+          <span class="job-compact-badge" style="color:#f5a623">⚠ unknown</span>
         </div>
-        <div class="job-actions">${linkBtn}${logBtn}</div>
+        <div class="job-compact-actions">${copyEmailBtn}${linkBtn}${logBtn}</div>
       </div>`;
     }
 
     // Error
     if (r.error) {
-      return `<div class="job cp-result-item" data-idx="${i}" style="border-left:3px solid var(--red);cursor:pointer">
+      return `<div class="job-compact cp-result-item" data-idx="${i}" style="border-left:3px solid var(--red)">
         <div class="job-index">${i + 1}</div>
         <div class="job-status status-error">err</div>
-        <div class="job-main">
-          <div class="job-email">${escHtml(r.email || s.email || '—')}</div>
-          <div class="job-meta" style="color:var(--red)">${escHtml(r.error)}</div>
+        <div class="job-compact-main">
+          <span class="job-compact-email">${escHtml(email)}</span>
+          <span class="job-compact-badge" style="color:var(--red);font-weight:normal;font-size:10px">${escHtml(r.error.slice(0, 40))}</span>
         </div>
-        <div class="job-actions">${logBtn}</div>
+        <div class="job-compact-actions">${copyEmailBtn}${logBtn}</div>
       </div>`;
     }
 
@@ -112,21 +113,20 @@
     const isFree = r.is_free;
     const color = isFree ? 'var(--green)' : 'var(--red)';
     const badge = isFree
-      ? `<span style="color:var(--green);font-weight:600">✅ FREE${r.trial_days ? ` (${r.trial_days}d trial)` : ''}</span>`
-      : `<span style="color:var(--red);font-weight:600">💳 PAID — ${escHtml(fmtAmount(r.amount_due, r.currency))}</span>`;
+      ? `✅ FREE${r.trial_days ? ` (${r.trial_days}d)` : ''}`
+      : `💳 ${escHtml(fmtAmount(r.amount_due, r.currency))}`;
     const linkBtn = r.payment_url
-      ? `<button class="icon-btn" onclick="event.stopPropagation();window.GptUi.copyText(${JSON.stringify(r.payment_url)})" title="Copy payment link">🔗</button>`
+      ? `<button class="icon-btn" onclick="event.stopPropagation();window.GptUi.copyText(${JSON.stringify(r.payment_url)})" title="Copy link">🔗</button>`
       : '';
 
-    return `<div class="job cp-result-item" data-idx="${i}" style="border-left:3px solid ${color};cursor:pointer">
+    return `<div class="job-compact cp-result-item" data-idx="${i}" style="border-left:3px solid ${color}">
       <div class="job-index">${i + 1}</div>
       <div class="job-status ${isFree ? 'status-success' : 'status-error'}">${isFree ? 'free' : 'paid'}</div>
-      <div class="job-main">
-        <div class="job-email">${escHtml(r.email || s.email || '—')}</div>
-        <div class="job-meta">${badge}${r.product ? ' · ' + escHtml(r.product) : ''}</div>
-        ${r.payment_url ? `<div class="job-meta muted" style="font-size:10px;word-break:break-all">${escHtml(r.payment_url)}</div>` : ''}
+      <div class="job-compact-main">
+        <span class="job-compact-email">${escHtml(email)}</span>
+        <span class="job-compact-badge" style="color:${color}">${badge}</span>
       </div>
-      <div class="job-actions">${linkBtn}${logBtn}</div>
+      <div class="job-compact-actions">${copyEmailBtn}${linkBtn}${logBtn}</div>
     </div>`;
   }
 

@@ -781,6 +781,58 @@ body {
   outline: 1px solid var(--accent);
 }
 
+/* Compact row — dùng cho Check Payment results */
+.job-compact {
+  display: grid;
+  grid-template-columns: 22px 56px 1fr auto;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+  margin-bottom: 2px;
+  cursor: pointer;
+  border: 1px solid transparent;
+  min-height: 28px;
+  transition: background 0.1s;
+}
+.job-compact:hover { background: var(--bg-elev-2); }
+.job-compact .job-index { font-size: 10px; }
+.job-compact .job-status { width: 48px; font-size: 9px; padding: 1px 4px; }
+.job-compact-main {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.job-compact-email {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--fg);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  flex: 1;
+}
+.job-compact-badge {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.job-compact-actions {
+  display: flex;
+  gap: 3px;
+  align-items: center;
+  flex-shrink: 0;
+}
+.job-compact-actions .icon-btn {
+  width: 22px;
+  height: 22px;
+  font-size: 11px;
+}
+
 .shot-copy-btn {
   background: none;
   border: none;
