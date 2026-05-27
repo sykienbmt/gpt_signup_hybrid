@@ -29,7 +29,7 @@
     order: [],                // job id order
     activeJobId: null,        // job đang xem log
     maxConcurrent: 3,
-    mode: _savedSettings.mode || 'multi',
+    mode: (() => { const m = _savedSettings.mode; if (!m || m === 'multi') return '2'; if (m === 'single') return '1'; return m; })(),
     headless: _savedSettings.headless !== undefined ? _savedSettings.headless : false,
     debug: _savedSettings.debug || false,
     mailModes: [],            // [{id, label, input_placeholder, input_help, config_schema}]
@@ -55,8 +55,9 @@
     logTarget:   $('log-target'),
     successPane: $('success-pane'),
     errorPane:   $('error-pane'),
-    btnCopySuccess: $('btn-copy-success'),
-    btnCopyError:   $('btn-copy-error'),
+    btnCopySuccess:    $('btn-copy-success'),
+    btnDownloadSuccess: $('btn-download-success'),
+    btnCopyError:       $('btn-copy-error'),
     btnFetchSessions:    $('btn-fetch-sessions'),
     fetchSessionsStatus: $('fetch-sessions-status'),
     statusPill:  $('status-pill'),
@@ -147,10 +148,28 @@
   }
 
   function copyText(text) {
-    return navigator.clipboard.writeText(text).catch(() => {
-      alert('Copy failed.');
-      throw new Error('copy failed');
-    });
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      return navigator.clipboard.writeText(text).catch(() => _copyFallback(text));
+    }
+    return Promise.resolve(_copyFallback(text));
+  }
+
+  function _copyFallback(text) {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.cssText = 'position:fixed;top:-9999px;left:-9999px;opacity:0';
+    document.body.appendChild(ta);
+    ta.focus(); ta.select();
+    try { document.execCommand('copy'); } catch { alert('Copy failed.'); }
+    document.body.removeChild(ta);
+  }
+
+  function downloadText(text, filename) {
+    const blob = new Blob([text], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = filename; a.click();
+    URL.revokeObjectURL(url);
   }
 
   function activateTab(tabId) {
@@ -478,7 +497,7 @@
     dom.btnRun.disabled = true;
     try {
       // Luôn sync config server trước khi chạy
-      const target = state.mode === 'single' ? 1 : 2;
+      const target = parseInt(state.mode, 10) || 1;
       await api('/api/config', {
         method: 'POST',
         body: JSON.stringify({ max_concurrent: target }),
@@ -551,7 +570,7 @@
   dom.modeSelect.addEventListener('change', async () => {
     state.mode = dom.modeSelect.value;
     saveSettings({ mode: state.mode });
-    const target = state.mode === 'single' ? 1 : 2;
+    const target = parseInt(state.mode, 10) || 1;
     try {
       await api('/api/config', {
         method: 'POST',
@@ -640,9 +659,15 @@
     saveSettings({ default_password: dom.defaultPassword.value });
   });
 
-  // ── Copy buttons ─────────────────────────────────────────────────
+  // ── Copy / Download buttons ───────────────────────────────────────
   dom.btnCopySuccess.addEventListener('click', () => copyText(dom.successPane.textContent));
   dom.btnCopyError.addEventListener('click', () => copyText(dom.errorPane.textContent));
+  dom.btnDownloadSuccess.addEventListener('click', () => {
+    const text = dom.successPane.textContent || '';
+    if (!text || text.startsWith('Format:')) { alert('Chưa có session nào thành công.'); return; }
+    const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 16);
+    downloadText(text, `accounts-${ts}.txt`);
+  });
 
   // ── SSE event stream ─────────────────────────────────────────────
   function applySnapshot(jobs) {

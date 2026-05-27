@@ -249,7 +249,7 @@
     dom.btnRun.disabled = true;
     try {
       // Sync config
-      const target = document.getElementById('mode').value === 'single' ? 1 : 2;
+      const target = parseInt(document.getElementById('mode').value, 10) || 1;
       await api('/api/session/config', {
         method: 'POST',
         body: JSON.stringify({ max_concurrent: target }),

@@ -29,3 +29,7 @@ runtime/
 
 # HAR debug captures
 *.har
+
+# SSH keys (keep local only, never commit)
+*.key
+*.pem

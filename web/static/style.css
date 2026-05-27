@@ -372,6 +372,35 @@ body {
   .settings-divider {
     display: none;
   }
+
+  /* Job rows mobile: stack email + actions */
+  .job {
+    grid-template-columns: auto auto 1fr;
+    grid-template-rows: auto auto;
+    row-gap: 6px;
+  }
+  .job-duration { display: none; }
+  .job-actions {
+    grid-column: 1 / -1;
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+  .icon-btn {
+    width: 28px;
+    height: 28px;
+  }
+
+  /* card-head-actions wrap on mobile */
+  .card-head-actions {
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  /* card-actions (Run/Stop/Clear row) wrap */
+  .card-actions {
+    flex-wrap: wrap;
+    gap: 6px;
+  }
 }
 
 /* Card */
