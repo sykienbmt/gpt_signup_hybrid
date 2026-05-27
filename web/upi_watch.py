@@ -251,15 +251,19 @@ class UpiWatchManager:
                 slot.status_msg = "Clicking subscribe…"
                 await _click_subscribe(page)
 
-                # Wait for QR
+                # Wait for QR — retry subscribe if no QR after 10s (button sometimes unresponsive)
                 slot.status = "waiting_qr"
-                slot.status_msg = "Waiting for QR code… (up to 40s)"
+                slot.status_msg = "Waiting for QR code…"
                 qr_sel = (
                     'img[data-testid="QRCode-image"], img.QRCode-image,'
                     ' img[src*="qr.stripe.com"]'
                 )
                 qr_found = False
+                _RETRY_INTERVAL = 10.0   # retry subscribe every 10s if no QR
+                _MAX_RETRIES = 3
+                _retry_count = 0
                 deadline = time.monotonic() + 40.0
+                _next_retry_at = time.monotonic() + _RETRY_INTERVAL
                 while time.monotonic() < deadline and not slot._action_event.is_set():
                     for frame in page.frames:
                         try:
@@ -271,6 +275,14 @@ class UpiWatchManager:
                             continue
                     if qr_found:
                         break
+                    # Retry subscribe if no QR after RETRY_INTERVAL seconds
+                    if (time.monotonic() >= _next_retry_at
+                            and _retry_count < _MAX_RETRIES
+                            and not slot._action_event.is_set()):
+                        _retry_count += 1
+                        slot.status_msg = f"No QR — retrying subscribe (attempt {_retry_count}/{_MAX_RETRIES})…"
+                        await _click_subscribe(page)
+                        _next_retry_at = time.monotonic() + _RETRY_INTERVAL
                     await asyncio.sleep(0.5)
 
                 if slot._action_event.is_set():

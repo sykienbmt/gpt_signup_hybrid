@@ -168,8 +168,8 @@
         actions.push(
           `<button class="icon-btn" data-action="copy-link" data-id="${escHtml(id)}" title="Copy payment link">${window.GptUi.icon('link')}</button>`,
         );
-        // Trial: only copy + delete; no UPI, no open-link action buttons
-        if (!isTrial) {
+        // Always show open/UPI buttons — trial badge is informational only
+        {
           actions.push(
             `<a class="icon-btn" href="${escHtml(job.payment_link)}" target="_blank" rel="noopener noreferrer" title="Open payment link">🔗</a>`,
           );
@@ -348,11 +348,17 @@
       const shotUrl = s.has_screenshot
         ? `/api/link/watch/slot/${s.slot_idx}/screenshot?t=${s.screenshot_ts}`
         : '';
-      const actionBtns = isDone ? '' : `
+      const copyImgBtn = s.has_screenshot
+        ? `<button class="btn btn-ghost btn-small" data-watch-copy="${s.slot_idx}" title="Copy screenshot + email">📋 Copy</button>`
+        : '';
+      const actionBtns = `
         <div class="watch-slot-actions">
+          ${copyImgBtn}
+          ${!isDone ? `
           <button class="btn btn-ghost btn-small" data-watch-action="done" data-slot="${s.slot_idx}">✅ Done</button>
           <button class="btn btn-ghost btn-small" data-watch-action="fail" data-slot="${s.slot_idx}">❌ Fail</button>
           <button class="btn btn-ghost btn-small" data-watch-action="off"  data-slot="${s.slot_idx}">🔴 Off</button>
+          ` : ''}
         </div>`;
       return `<div class="watch-slot">
         <div class="watch-slot-header">
@@ -365,6 +371,48 @@
         ${actionBtns}
       </div>`;
     }).join('');
+  }
+
+  async function copyWatchSlotImage(slotIdx) {
+    const s = state.watch.slots.find((sl) => sl.slot_idx === slotIdx);
+    if (!s || !s.has_screenshot) return;
+    try {
+      const url = `/api/link/watch/slot/${slotIdx}/screenshot?t=${s.screenshot_ts}`;
+      const resp = await fetch(url);
+      const blob = await resp.blob();
+      const imgUrl = URL.createObjectURL(blob);
+      const img = new Image();
+      await new Promise((res, rej) => { img.onload = res; img.onerror = rej; img.src = imgUrl; });
+
+      const canvas = document.createElement('canvas');
+      canvas.width = img.width;
+      canvas.height = img.height + 34;
+      const ctx = canvas.getContext('2d');
+
+      // Email banner at top
+      ctx.fillStyle = '#1a1a2e';
+      ctx.fillRect(0, 0, canvas.width, 34);
+      ctx.fillStyle = '#ffffff';
+      ctx.font = 'bold 14px system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(s.email, canvas.width / 2, 17);
+
+      // Screenshot below
+      ctx.drawImage(img, 0, 34);
+      URL.revokeObjectURL(imgUrl);
+
+      await new Promise((res) => canvas.toBlob(async (resultBlob) => {
+        await navigator.clipboard.write([new ClipboardItem({ 'image/png': resultBlob })]);
+        res();
+      }, 'image/png'));
+
+      // Flash feedback on button
+      const btn = dom.watchSlots.querySelector(`[data-watch-copy="${slotIdx}"]`);
+      if (btn) { const t = btn.textContent; btn.textContent = '✅ Copied'; setTimeout(() => { btn.textContent = t; }, 1500); }
+    } catch (err) {
+      alert('Copy image failed: ' + err.message);
+    }
   }
 
   async function pollWatchStatus() {
@@ -478,6 +526,13 @@
 
   // Watch slot action buttons (event delegation on watch slots container)
   dom.watchSlots.addEventListener('click', async (e) => {
+    // Copy image button
+    const copyBtn = e.target.closest('[data-watch-copy]');
+    if (copyBtn) {
+      copyWatchSlotImage(parseInt(copyBtn.dataset.watchCopy, 10));
+      return;
+    }
+    // Done / Fail / Off buttons
     const btn = e.target.closest('[data-watch-action]');
     if (!btn) return;
     const action = btn.dataset.watchAction;

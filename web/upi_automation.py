@@ -452,14 +452,17 @@ async def run_upi_automation(
                 _log(f"[upi] ⚠️ screenshot failed: {exc}")
                 return None
 
-        # Wait up to 40s for Stripe UPI QR popup to appear (search all frames since
-        # the QR is typically rendered inside a Stripe-hosted iframe).
+        # Wait up to 40s for Stripe UPI QR popup — retry subscribe every 10s if no QR
         qr_selector = (
             'img[data-testid="QRCode-image"], img.QRCode-image, '
             'img[src*="qr.stripe.com"]'
         )
         qr_element = None
+        _retry_interval = 10.0
+        _max_retries = 3
+        _retry_count = 0
         qr_deadline = time.monotonic() + 40.0
+        _next_retry_at = time.monotonic() + _retry_interval
         while time.monotonic() < qr_deadline:
             for frame in page.frames:
                 try:
@@ -471,6 +474,12 @@ async def run_upi_automation(
                     continue
             if qr_element is not None:
                 break
+            # Retry subscribe if button was unresponsive
+            if time.monotonic() >= _next_retry_at and _retry_count < _max_retries:
+                _retry_count += 1
+                _log(f"[upi] ⟳ no QR after {int(_retry_interval)}s — retrying subscribe ({_retry_count}/{_max_retries})")
+                await _click_subscribe(page)
+                _next_retry_at = time.monotonic() + _retry_interval
             await asyncio.sleep(0.5)
 
         if qr_element is not None:
