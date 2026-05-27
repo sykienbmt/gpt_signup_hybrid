@@ -363,22 +363,21 @@
     </div>
   </section>
 
-  <section class="card card-jobs">
+  <section class="card card-jobs" style="display:flex;flex-direction:column">
     <header class="card-head">
       <h2>Results</h2>
       <span class="muted" id="cp-summary"></span>
     </header>
-    <div id="cp-result-list" class="job-list">
+    <div id="cp-result-list" class="job-list" style="flex:1;min-height:0">
       <div class="empty">Paste sessions and click Check.</div>
     </div>
-  </section>
-
-  <section class="card" id="cp-log-card" style="grid-column:1/-1;display:none">
-    <header class="card-head">
-      <h2>Log — <span id="cp-log-label" class="muted"></span></h2>
-      <button id="cp-log-close" class="icon-btn" title="Close">✕</button>
-    </header>
-    <pre id="cp-log-body" style="margin:0;padding:12px 16px;font-size:12px;line-height:1.6;white-space:pre-wrap;word-break:break-all;max-height:200px;overflow-y:auto;background:var(--bg);border-radius:0 0 8px 8px"></pre>
+    <div id="cp-log-panel" style="display:none;border-top:1px solid var(--border);flex-shrink:0">
+      <div class="card-head" style="padding:8px 16px;min-height:unset">
+        <span style="font-size:12px;font-weight:600">📋 Log — <span id="cp-log-label" class="muted"></span></span>
+        <button id="cp-log-close" class="icon-btn" title="Close log" style="margin-left:auto">✕</button>
+      </div>
+      <pre id="cp-log-body" style="margin:0;padding:8px 16px 12px;font-size:11px;line-height:1.6;white-space:pre-wrap;word-break:break-all;max-height:160px;overflow-y:auto;background:var(--bg-secondary,var(--bg))"></pre>
+    </div>
   </section>
 </main>
 
