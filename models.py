@@ -42,15 +42,15 @@ class SignupRequest(BaseModel):
     #   - Gmail Advanced (checkotpgmail.live API) — cho mail @gmail.com mua qua dịch vụ.
     mail_provider: str = Field(
         default="worker",
-        description="Provider: 'worker', 'outlook', 'gmail_advanced', hoặc 'smsbower'.",
-        pattern="^(worker|outlook|gmail_advanced|smsbower)$",
+        description="Provider: 'worker', 'outlook', 'gmail_advanced', hoặc 'smsbower' / 'smsbower_direct'.",
+        pattern="^(worker|outlook|gmail_advanced|smsbower|smsbower_direct)$",
     )
     # Gmail Advanced config
     gmail_api_url: str | None = Field(
         default=None,
         description="API URL checkotpgmail.live (dùng khi mail_provider='gmail_advanced').",
     )
-    # SmsBower config
+    # SmsBower config (Worker-style API)
     smsbower_api_url: str | None = Field(
         default=None,
         description="API URL smsbower.page (dùng khi mail_provider='smsbower').",
@@ -61,6 +61,23 @@ class SignupRequest(BaseModel):
             "[smsbower] Nếu > 0: raise ngay khi len(all_codes) >= giá trị này "
             "và tất cả codes đều đã claimed — dùng cho recheck job (max=2)."
         ),
+    )
+    # SmsBower Direct API config (auto acquire + auto poll)
+    smsbower_api_key: str | None = Field(
+        default=None,
+        description="SMSBower API key (dùng khi mail_provider='smsbower_direct').",
+    )
+    smsbower_service: str = Field(
+        default="dr",
+        description="SMSBower service code: dr=OpenAI/ChatGPT (smsbower_direct).",
+    )
+    smsbower_domain: str = Field(
+        default="gmail.com",
+        description="SMSBower domain: gmail.com, mailnestpro.com, etc. (smsbower_direct).",
+    )
+    smsbower_max_price: float | None = Field(
+        default=None,
+        description="Max price per mail (smsbower_direct). None = no limit.",
     )
     # Worker config
     email_logs_url: str = Field(
@@ -84,7 +101,7 @@ class SignupRequest(BaseModel):
         description="Combo `email|password|refresh_token|client_id` (Microsoft Graph).",
     )
     # Polling chung
-    otp_timeout_seconds: float = Field(default=180.0, ge=10, description="Thời gian tối đa đợi OTP về.")
+    otp_timeout_seconds: float = Field(default=90.0, ge=10, description="Thời gian tối đa đợi OTP về (90s cho smsbower_direct).")
     otp_poll_interval_seconds: float = Field(default=4.0, ge=0.5)
     otp_initial_delay_seconds: float = Field(
         default=0.0, ge=0,

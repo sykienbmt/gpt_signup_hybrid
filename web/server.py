@@ -1222,6 +1222,42 @@ async def stripe_poll_paid(request: Request) -> JSONResponse:
 
 
 # ─────────────────────────────────────────────────────────────────────
+# SMSBower API
+# ─────────────────────────────────────────────────────────────────────
+
+@app.get("/api/smsbower/balance")
+async def get_smsbower_balance(api_key: str = "V7JuZljb0RQDEzawWc6IO4LPAV3x71vo") -> JSONResponse:
+    """Get SMSBower account balance. Format: ACCESS_BALANCE:4.619"""
+    import httpx as _httpx
+    try:
+        async with _httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                "https://smsbower.page/stubs/handler_api.php",
+                params={"api_key": api_key, "action": "getBalance"}
+            )
+            if resp.status_code != 200:
+                raise Exception(f"HTTP {resp.status_code}")
+
+            # Parse plain text response: "ACCESS_BALANCE:4.619"
+            text = resp.text.strip()
+            if text.startswith("ACCESS_BALANCE:"):
+                balance_str = text.split(":", 1)[1].strip()
+                balance = float(balance_str)
+                return JSONResponse({
+                    "success": True,
+                    "balance": balance,
+                    "currency": "USD",
+                })
+            else:
+                raise Exception(f"Unexpected response format: {text[:100]}")
+    except Exception as e:
+        return JSONResponse({
+            "success": False,
+            "error": str(e),
+        }, status_code=500)
+
+
+# ─────────────────────────────────────────────────────────────────────
 # UPI Watch Mode
 # ─────────────────────────────────────────────────────────────────────
 

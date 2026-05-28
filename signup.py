@@ -15,6 +15,7 @@ from .mail_providers import (
     build_provider_gmail_advanced,
     build_provider_outlook,
     build_provider_smsbower,
+    build_provider_smsbower_direct,
     build_provider_worker,
 )
 from .models import SignupRequest, SignupResult
@@ -51,6 +52,15 @@ def _build_mail_provider(request: SignupRequest, *, settings) -> MailProvider:
             api_url=request.smsbower_api_url,
             max_all_codes=request.smsbower_max_all_codes,
         )
+    if request.mail_provider == "smsbower_direct":
+        if not request.smsbower_api_key:
+            raise ValueError("mail_provider='smsbower_direct' yêu cầu smsbower_api_key")
+        return build_provider_smsbower_direct(
+            api_key=request.smsbower_api_key,
+            service=request.smsbower_service,
+            domain=request.smsbower_domain,
+            max_price=request.smsbower_max_price,
+        )
     if request.mail_provider == "worker":
         return build_provider_worker(
             logs_url=request.email_logs_url,
@@ -85,7 +95,7 @@ async def run_signup(request: SignupRequest, *, log=print) -> SignupResult:
         otp_started_at = datetime.now(timezone.utc).replace(microsecond=0)
         provider = _build_mail_provider(request, settings=settings)
 
-        # ── Pre-check cho Gmail Advanced: verify mail_status=live trước khi mở browser ──
+        # ── Pre-check cho Gmail Advanced / SmsBower Direct: verify availability trước browser ──
         if hasattr(provider, "pre_check"):
             try:
                 await provider.pre_check(log=log)
@@ -95,11 +105,24 @@ async def run_signup(request: SignupRequest, *, log=print) -> SignupResult:
                     request = request.model_copy(update={"email": provider.email})
                     result.email = provider.email
                     log(f"[signup] email updated from API: {request.email}")
-            # Guard: nếu sau pre_check vẫn không có email thật → fail
-            if not provider.email or provider.email == "pending@gmail-advanced.local":
-                raise ValueError(
-                    "Gmail Advanced: API không trả email, không thể tiếp tục signup"
-                )
+            # Guard: nếu sau pre_check vẫn không có email thật → fail (chỉ cho Gmail Advanced)
+            if request.mail_provider == "gmail_advanced":
+                if not provider.email or provider.email == "pending@gmail-advanced.local":
+                    raise ValueError(
+                        "Gmail Advanced: API không trả email, không thể tiếp tục signup"
+                    )
+
+        # ── Acquire email cho SmsBower Direct trước browser phase ──
+        if hasattr(provider, "acquire_email"):
+            try:
+                await provider.acquire_email(log=log)
+            except Exception as e:
+                raise ValueError(f"Failed to acquire SMSBower email: {e}") from e
+            # Update email sau acquire
+            if provider.email and provider.email != request.email:
+                request = request.model_copy(update={"email": provider.email})
+                result.email = provider.email
+                log(f"[signup] email acquired: {request.email}")
 
         handoff, otp_seconds = await run_browser_phase(
             request=request,
@@ -137,6 +160,13 @@ async def run_signup(request: SignupRequest, *, log=print) -> SignupResult:
             result.age = today.year - int(y) - ((today.month, today.day) < (int(m), int(d)))
         except Exception:
             pass
+
+        # ── Mark success cho SmsBower Direct (charge account) ──
+        if hasattr(provider, "mark_success"):
+            try:
+                await provider.mark_success(log=log)
+            except Exception as e:
+                log(f"[signup] mark_success failed (non-fatal): {e}")
     except (BrowserPhaseError, HttpPhaseError, TimeoutError, ValueError, OutlookComboError, OutlookProviderUnavailable) as exc:
         result.error = f"{type(exc).__name__}: {exc}"
         log(f"[signup] FAILED: {result.error}")

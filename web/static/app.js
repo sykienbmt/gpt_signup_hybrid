@@ -29,7 +29,7 @@
     order: [],                // job id order
     activeJobId: null,        // job đang xem log
     maxConcurrent: 3,
-    mode: (() => { const m = _savedSettings.mode; if (!m || m === 'multi') return '2'; if (m === 'single') return '1'; return m; })(),
+    mode: (() => { const m = _savedSettings.mode; if (!m || m === 'multi') return '2'; if (m === 'single') return '1'; return m || '2'; })(),
     headless: _savedSettings.headless !== undefined ? _savedSettings.headless : false,
     debug: _savedSettings.debug || false,
     mailModes: [],            // [{id, label, input_placeholder, input_help, config_schema}]
@@ -496,22 +496,41 @@
     }
     dom.btnRun.disabled = true;
     try {
-      // Luôn sync config server trước khi chạy
-      const target = parseInt(state.mode, 10) || 1;
+      // Set 2 parallel workers (max_concurrent)
+      const maxConcurrent = 2;
       await api('/api/config', {
         method: 'POST',
-        body: JSON.stringify({ max_concurrent: target }),
+        body: JSON.stringify({ max_concurrent: maxConcurrent }),
       });
-      state.maxConcurrent = target;
+      state.maxConcurrent = maxConcurrent;
+
+      // For smsbower_direct: parse input as target success count
+      let finalCombos = combos;
+      let targetSuccess = null;
+      if (state.currentMailMode === 'smsbower_direct') {
+        const lines = combos.split('\n').map(l => l.trim()).filter(l => l);
+        const nums = lines.map(l => parseInt(l, 10)).filter(n => !isNaN(n) && n > 0);
+        if (nums.length > 0) {
+          targetSuccess = nums.reduce((a, b) => a + b, 0);  // Sum all numbers
+          // Auto-generate jobs: create 1.5x target as buffer
+          const jobCount = Math.ceil(targetSuccess * 1.5);
+          // Generate jobCount empty lines (each line = 1 job)
+          finalCombos = Array(jobCount).fill('(auto)').join('\n');
+          console.log(`[smsbower_direct] target success: ${targetSuccess}, queuing ${jobCount} jobs`);
+        }
+      }
 
       // Build payload theo mail mode
       const payload = {
-        combos,
+        combos: finalCombos,
         default_password: dom.defaultPassword.value.trim() || null,
         mail_mode: state.currentMailMode,
         gmail_alias_expand: (state.currentMailMode === 'gmail_advanced' || state.currentMailMode === 'smsbower') && dom.gmailAliasToggle.checked,
         gmail_alias_count: parseInt(dom.gmailAliasCount.value, 10) || 1,
       };
+      if (targetSuccess) {
+        payload.target_success = targetSuccess;  // For smsbower_direct
+      }
       if (state.currentMailMode === 'worker') {
         // Đọc trực tiếp từ DOM input (không chỉ localStorage — user có thể chưa trigger persist)
         const urlInp = dom.mailModeConfigHost.querySelector('input[data-config-key="logs_url"]');
@@ -525,6 +544,7 @@
         body: JSON.stringify(payload),
       });
     } catch (err) {
+      console.error('[btnRun] error:', err);
       alert('Error: ' + err.message);
     } finally {
       dom.btnRun.disabled = false;
@@ -885,6 +905,14 @@
       const uiCopy = mailModeUiCopy[modeId] || {};
       dom.comboInput.placeholder = uiCopy.input_placeholder || spec.input_placeholder;
       dom.inputHint.textContent = uiCopy.input_help || spec.input_help;
+      // For smsbower_direct: hide combo input, set placeholder to just "Enter count (1 per line)"
+      if (spec.input_type === 'count') {
+        dom.comboInput.placeholder = 'Enter number of accounts per line (blank = 1)';
+        dom.comboInput.style.minHeight = '60px';
+        dom.inputHint.textContent = spec.input_help || 'Each blank line = 1 account to create';
+      } else {
+        dom.comboInput.style.minHeight = '120px';
+      }
     }
     // Show alias toggle + count for gmail_advanced and smsbower
     const hasAlias = modeId === 'gmail_advanced' || modeId === 'smsbower';
@@ -893,7 +921,26 @@
     // Show Recheck & Run button only for smsbower
     dom.btnRecheck.classList.toggle('hidden', modeId !== 'smsbower');
     if (modeId !== 'smsbower') dom.recheckStatus.textContent = '';
+    // Show SMSBower balance strip for smsbower_direct
+    const showBalance = modeId === 'smsbower_direct';
+    $('smsbower-strip').style.display = showBalance ? 'block' : 'none';
+    if (showBalance) refreshSmsBowerBalance();
     renderMailModeConfig(state.mailModes, modeId);
+  }
+
+  async function refreshSmsBowerBalance() {
+    const balanceEl = $('smsbower-balance');
+    balanceEl.textContent = 'Loading...';
+    try {
+      const data = await api('/api/smsbower/balance');
+      if (data.success && data.balance !== undefined) {
+        balanceEl.textContent = `$${data.balance.toFixed(2)} USD`;
+      } else {
+        balanceEl.textContent = `Error: ${data.error || 'Unknown'}`;
+      }
+    } catch (err) {
+      balanceEl.textContent = `Error: ${err.message}`;
+    }
   }
 
   async function bootstrapMailModes() {
@@ -1009,6 +1056,7 @@
 
   dom.btnProxyTest.addEventListener('click', () => testProxy({ silent: false }));
   dom.btnProxySave.addEventListener('click', () => saveProxy());
+  $('btn-smsbower-refresh').addEventListener('click', () => refreshSmsBowerBalance());
   dom.proxyInput.addEventListener('input', () => {
     state.proxyEditing = true;
   });

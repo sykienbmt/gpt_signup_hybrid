@@ -557,10 +557,10 @@ async def _drive_signup_flow(
                 await asyncio.sleep(request.otp_initial_delay_seconds)
 
             # Poll OTP, skip codes đã thử.
-            # Nếu đợi >30s chưa có code mới → click Resend rồi poll tiếp.
+            # Nếu đợi > timeout chưa có code mới → click Resend rồi poll tiếp.
             # iCloud có thể gửi mail mới trước, mail cũ delay → lấy nhiều codes
             # rồi thử lần lượt trước khi resend.
-            resend_after_seconds = 30.0
+            resend_after_seconds = request.otp_timeout_seconds  # Use config timeout (100s for smsbower_direct)
             resend_count = 0
             max_resends = request.otp_max_resends  # configurable per provider
             stale_poll_count = 0  # đếm lần poll liên tiếp chỉ nhận code cũ

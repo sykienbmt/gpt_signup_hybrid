@@ -1028,6 +1028,174 @@ class SmsBowerProvider:
                 await asyncio.sleep(min(poll_interval_seconds, remaining))
 
 
+class SmsBowerDirectProvider:
+    """Direct integration với SMSBower API (smsbower.page/api/mail).
+
+    Tự động acquire email via getActivation, poll OTP via getCode,
+    cancel via setStatus nếu timeout.
+
+    Features:
+    - Auto apply dot alias (e.g., abc@gmail.com → a.bc@gmail.com)
+    - Auto cancel & refund nếu timeout OTP
+    """
+
+    API_BASE = "https://smsbower.page/api/mail"
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        service: str,
+        domain: str = "gmail.com",
+        max_price: float | None = None,
+        apply_dot_alias: bool = True,
+    ):
+        if not api_key:
+            raise ValueError("SMSBower api_key is required")
+        self.api_key = api_key
+        self.service = service
+        self.domain = domain
+        self.max_price = max_price
+        self.apply_dot_alias = apply_dot_alias
+        self.email: str | None = None
+        self.mail_id: int | None = None
+        self.original_email: str | None = None
+
+    async def _call_api(self, endpoint: str, params: dict) -> dict:
+        """Call SMSBower API endpoint."""
+        params["api_key"] = self.api_key
+        url = f"{self.API_BASE}/{endpoint}"
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(url, params=params)
+            if resp.status_code != 200:
+                raise RuntimeError(
+                    f"SMSBower {endpoint} HTTP {resp.status_code}: {resp.text[:200]}"
+                )
+            return resp.json()
+
+    async def pre_check(self, *, log) -> None:
+        """Check price & availability before signup."""
+        log(f"[otp:smsbower_direct] pre-check: service={self.service}, domain={self.domain}")
+
+        data = await self._call_api("getPriceRests", {"service": self.service, "domain": self.domain})
+
+        if data.get("status") != 1:
+            raise ValueError(f"SMSBower getPriceRests failed: {data}")
+
+        service_data = data.get("data", {}).get(self.service, {}).get(self.domain)
+        if not service_data:
+            raise ValueError(
+                f"SMSBower: no stock for service={self.service}, domain={self.domain}"
+            )
+
+        price = service_data.get("price", 0)
+        count = service_data.get("count", 0)
+
+        if self.max_price and price > self.max_price:
+            raise ValueError(
+                f"SMSBower: price ${price} exceeds max ${self.max_price}"
+            )
+
+        if count <= 0:
+            raise ValueError(
+                f"SMSBower: no stock available (count={count})"
+            )
+
+        log(f"[otp:smsbower_direct] pre-check OK: price=${price}, stock={count}")
+
+    async def acquire_email(self, *, log) -> None:
+        """Acquire email via getActivation. Optionally apply dot alias."""
+        log(f"[otp:smsbower_direct] acquiring email...")
+
+        data = await self._call_api(
+            "getActivation",
+            {
+                "service": self.service,
+                "domain": self.domain,
+                "maxPrice": self.max_price or 100,
+            }
+        )
+
+        if data.get("status") != 1:
+            raise RuntimeError(f"SMSBower getActivation failed: {data.get('error', data)}")
+
+        raw_email = data.get("mail")
+        self.mail_id = data.get("mailId")
+
+        if not raw_email or not self.mail_id:
+            raise RuntimeError("SMSBower getActivation: missing mail or mailId")
+
+        self.original_email = raw_email
+
+        # Apply dot alias nếu enabled (convert abc@gmail.com → a.bc@gmail.com)
+        if self.apply_dot_alias and self.domain == "gmail.com":
+            self.email = smsbower_dot_alias(raw_email)
+            log(f"[otp:smsbower_direct] acquired: {self.original_email} → {self.email} (ID: {self.mail_id})")
+        else:
+            self.email = raw_email
+            log(f"[otp:smsbower_direct] acquired: {self.email} (ID: {self.mail_id})")
+
+    async def poll_otp(
+        self,
+        *,
+        recipient: str,
+        started_at: datetime,
+        timeout_seconds: float,
+        poll_interval_seconds: float,
+        log,
+    ) -> str:
+        """Poll OTP via getCode. 1 email = 1 attempt, no retry."""
+        if not self.email or not self.mail_id:
+            raise RuntimeError("Email not acquired yet")
+
+        deadline = time.monotonic() + max(timeout_seconds, 1.0)
+        log(f"[otp:smsbower_direct] polling {self.email} (timeout {timeout_seconds:.0f}s)")
+
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                data = await self._call_api("getCode", {"mailId": self.mail_id})
+
+                if data.get("status") == 1:
+                    code = data.get("code", "").strip()
+                    if code and len(code) == 6 and code.isdigit():
+                        log(f"[otp:smsbower_direct] found OTP {code} (attempt {attempt})")
+                        return code
+
+                error = data.get("error", "")
+                if attempt <= 3 or attempt % 6 == 0:
+                    elapsed = int(time.monotonic() - (deadline - timeout_seconds))
+                    log(f"[otp:smsbower_direct] waiting {elapsed}s... {error} (attempt {attempt})")
+
+            except (httpx.HTTPError, RuntimeError) as exc:
+                log(f"[otp:smsbower_direct] error attempt {attempt}: {exc}")
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                # Timeout → cancel & refund, job ends (no retry)
+                try:
+                    await self._call_api("setStatus", {"id": self.mail_id, "status": 2})
+                    log(f"[otp:smsbower_direct] OTP timeout 90s — cancelled & refunded (ID: {self.mail_id})")
+                except Exception as e:
+                    log(f"[otp:smsbower_direct] cancel failed: {e}")
+
+                raise TimeoutError(f"OTP timeout after {timeout_seconds}s for {self.email}")
+
+            await asyncio.sleep(min(poll_interval_seconds, remaining))
+
+    async def mark_success(self, *, log) -> None:
+        """Mark activation as complete (setStatus=3) to charge."""
+        if not self.mail_id:
+            return
+
+        try:
+            await self._call_api("setStatus", {"id": self.mail_id, "status": 3})
+            log(f"[otp:smsbower_direct] marked success & charged (ID: {self.mail_id})")
+        except Exception as e:
+            log(f"[otp:smsbower_direct] mark_success failed: {e}")
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Factory
 # ─────────────────────────────────────────────────────────────────────
@@ -1056,3 +1224,20 @@ def build_provider_smsbower(
     *, email: str, api_url: str, max_all_codes: int = 0,
 ) -> SmsBowerProvider:
     return SmsBowerProvider(api_url=api_url, email=email, max_all_codes=max_all_codes)
+
+
+def build_provider_smsbower_direct(
+    *,
+    api_key: str,
+    service: str = "dr",
+    domain: str = "gmail.com",
+    max_price: float | None = None,
+    apply_dot_alias: bool = True,
+) -> SmsBowerDirectProvider:
+    return SmsBowerDirectProvider(
+        api_key=api_key,
+        service=service,
+        domain=domain,
+        max_price=max_price,
+        apply_dot_alias=apply_dot_alias,
+    )

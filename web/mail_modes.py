@@ -16,6 +16,7 @@ from ..mail_providers import (
     GmailAdvancedProvider, GmailAdvancedParseError,
     SmsBowerProvider, SmsBowerParseError,
     smsbower_dot_alias,
+    SmsBowerDirectProvider,
 )
 from ..models import SignupRequest
 
@@ -53,6 +54,7 @@ class MailModeSpec:
     config_schema: list[dict[str, Any]]
     parse_line: Callable[[str], ParsedLine]
     build_request: Callable[..., SignupRequest]
+    input_type: str = "text"  # "text" (default) hoặc "count" (auto-acquire mode)
 
 
 # ─── Outlook mode ─────────────────────────────────────────────────────
@@ -290,6 +292,107 @@ SMSBOWER_MODE = MailModeSpec(
 )
 
 
+# ─── SmsBower Direct mode (auto acquire + auto poll) ──────────────────
+
+def _parse_smsbower_direct_line(line: str) -> ParsedLine:
+    """Parse line — chỉ cần số lượng (count), email tự acquire từ API.
+
+    Format: empty line hoặc just a number = create 1 account per line.
+    Tức mỗi dòng = 1 account, không cần nhập gì cả.
+    """
+    return ParsedLine(email=f"(auto-acquire)", raw=line.strip())
+
+
+def _build_smsbower_direct_request(
+    parsed: ParsedLine,
+    *,
+    worker_config: dict[str, str] | None = None,
+    password: str | None = None,
+    headless: bool = True,
+    keep_browser_open: bool = False,
+    proxy: str | None = None,
+) -> SignupRequest:
+    cfg = worker_config or {}
+    # Default values từ user config
+    api_key = cfg.get("api_key", "V7JuZljb0RQDEzawWc6IO4LPAV3x71vo")
+    service = cfg.get("service", "dr")
+    domain = cfg.get("domain", "gmail.com")
+    max_price_str = cfg.get("max_price", "")
+    max_price = float(max_price_str) if max_price_str else 0.01  # Auto lowest price
+
+    from ..config import env_insecure_tls
+    return SignupRequest(
+        email="pending@smsbower-direct.local",  # Placeholder — sẽ resolve từ acquire_email()
+        mail_provider="smsbower_direct",
+        smsbower_api_key=api_key,
+        smsbower_service=service,
+        smsbower_domain=domain,
+        smsbower_max_price=max_price,
+        otp_timeout_seconds=100.0,  # Poll OTP 100s (10s interval = 10 attempts)
+        otp_poll_interval_seconds=10.0,  # Check API mỗi 10s
+        otp_max_resends=0,  # Không reload/resend, chỉ tiếp tục poll
+        otp_resend_on_reject=False,  # Không click "Resend" — tiếp tục poll để xem có code lần 2
+        headless=headless,
+        keep_browser_open=keep_browser_open,
+        password=password,
+        proxy=proxy,
+        tls_insecure=env_insecure_tls(),
+    )
+
+
+SMSBOWER_DIRECT_MODE = MailModeSpec(
+    id="smsbower_direct",
+    label="SMSBower Direct (Auto)",
+    input_placeholder="\n\n",
+    input_help="Mỗi dòng (trống): 1 account. Email tự acquire từ API + apply dot alias.",
+    input_type="count",  # Special mode: chỉ nhập số lượng, không cần combo
+    config_schema=[
+        {
+            "key": "api_key",
+            "label": "API Key",
+            "type": "text",
+            "default": "V7JuZljb0RQDEzawWc6IO4LPAV3x71vo",
+            "required": True,
+            "secret": True,
+        },
+        {
+            "key": "service",
+            "label": "Service Code",
+            "type": "select",
+            "options": [
+                {"value": "dr", "label": "OpenAI/ChatGPT (dr)"},
+                {"value": "oi", "label": "Tinder"},
+                {"value": "ig", "label": "Instagram"},
+                {"value": "fb", "label": "Facebook"},
+            ],
+            "default": "dr",
+        },
+        {
+            "key": "domain",
+            "label": "Domain",
+            "type": "select",
+            "options": [
+                {"value": "gmail.com", "label": "Gmail"},
+                {"value": "mailnestpro.com", "label": "Mailnestpro"},
+                {"value": "hihinail.com", "label": "Hihinail"},
+                {"value": "flytempbox.com", "label": "Flytempbox"},
+            ],
+            "default": "gmail.com",
+        },
+        {
+            "key": "max_price",
+            "label": "Max Price ($)",
+            "type": "text",
+            "default": "",
+            "required": False,
+            "placeholder": "Leave blank for lowest price (0.01)",
+        },
+    ],
+    parse_line=_parse_smsbower_direct_line,
+    build_request=_build_smsbower_direct_request,
+)
+
+
 # ─── Registry ─────────────────────────────────────────────────────────
 
 
@@ -298,6 +401,7 @@ _REGISTRY: dict[str, MailModeSpec] = {
     WORKER_MODE.id: WORKER_MODE,
     GMAIL_ADVANCED_MODE.id: GMAIL_ADVANCED_MODE,
     SMSBOWER_MODE.id: SMSBOWER_MODE,
+    SMSBOWER_DIRECT_MODE.id: SMSBOWER_DIRECT_MODE,
 }
 
 
@@ -318,6 +422,7 @@ def serialize_for_api() -> list[dict[str, Any]]:
             "label": spec.label,
             "input_placeholder": spec.input_placeholder,
             "input_help": spec.input_help,
+            "input_type": spec.input_type,
             "config_schema": spec.config_schema,
         }
         for spec in _REGISTRY.values()
