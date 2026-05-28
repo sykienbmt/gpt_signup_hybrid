@@ -142,7 +142,12 @@
     dom.errorPane.textContent = errors.length ? errors.join('\n') : 'No errors yet.';
   }
 
+  function isPickerOpen() {
+    return dom.watchPicker.style.display !== 'none';
+  }
+
   function renderJobs() {
+    if (isPickerOpen()) return; // don't thrash DOM while picker is open
     if (state.order.length === 0) {
       dom.jobList.innerHTML = '<div class="empty">Paste input and click Get Link.</div>';
       dom.jobSummary.textContent = '0 total';
@@ -336,41 +341,103 @@
     error: 'var(--red)', off: 'var(--muted)',
   };
 
+  function renderWatchSlot(s) {
+    const color = WATCH_STATUS_COLOR[s.status] || 'var(--fg)';
+    const label = WATCH_STATUS_LABEL[s.status] || s.status;
+    const isDone = ['done', 'failed', 'off'].includes(s.status);
+    const shotUrl = s.has_screenshot
+      ? `/api/link/watch/slot/${s.slot_idx}/screenshot?t=${s.screenshot_ts}`
+      : '';
+    const copyImgBtn = s.has_screenshot
+      ? `<button class="btn btn-ghost btn-small" data-watch-copy="${s.slot_idx}" title="Copy screenshot + email">📋 Copy</button>`
+      : '';
+    const actionBtns = `
+      <div class="watch-slot-actions">
+        ${copyImgBtn}
+        ${!isDone ? `
+        <button class="btn btn-ghost btn-small" data-watch-action="done" data-slot="${s.slot_idx}">✅ Done</button>
+        <button class="btn btn-ghost btn-small" data-watch-action="fail" data-slot="${s.slot_idx}">❌ Fail</button>
+        <button class="btn btn-ghost btn-small" data-watch-action="off"  data-slot="${s.slot_idx}">🔴 Off</button>
+        ` : ''}
+      </div>`;
+    return `<div class="watch-slot" data-slot-idx="${s.slot_idx}">
+      <div class="watch-slot-header">
+        <span class="watch-slot-idx">${s.slot_idx + 1}</span>
+        <span class="watch-slot-email" title="${escHtml(s.email)}">${escHtml(s.email)}</span>
+        <span class="watch-slot-status" style="color:${color}">${label}</span>
+      </div>
+      <div class="watch-slot-msg muted">${escHtml(s.status_msg)}</div>
+      ${shotUrl ? `<img class="watch-slot-shot" data-slot-shot="${s.slot_idx}" src="${escHtml(shotUrl)}" alt="screenshot">` : '<div class="watch-slot-no-shot muted">No screenshot yet</div>'}
+      ${actionBtns}
+    </div>`;
+  }
+
   function renderWatchPanel() {
     const { active, slots } = state.watch;
     dom.watchPanel.style.display = active ? '' : 'none';
     if (!active) return;
 
-    dom.watchSlots.innerHTML = slots.map((s) => {
+    // First render: build all slots from scratch
+    const existing = dom.watchSlots.querySelectorAll('[data-slot-idx]');
+    if (existing.length !== slots.length) {
+      dom.watchSlots.innerHTML = slots.map(renderWatchSlot).join('');
+      slots.forEach((s) => { _watchShotTs[s.slot_idx] = s.screenshot_ts; });
+      return;
+    }
+
+    // Subsequent renders: patch only changed parts to avoid image reload
+    slots.forEach((s) => {
+      const el = dom.watchSlots.querySelector(`[data-slot-idx="${s.slot_idx}"]`);
+      if (!el) return;
+
+      // Update status text
       const color = WATCH_STATUS_COLOR[s.status] || 'var(--fg)';
       const label = WATCH_STATUS_LABEL[s.status] || s.status;
+      const statusEl = el.querySelector('.watch-slot-status');
+      if (statusEl) { statusEl.textContent = label; statusEl.style.color = color; }
+      const msgEl = el.querySelector('.watch-slot-msg');
+      if (msgEl) msgEl.textContent = s.status_msg;
+
+      // Only reload image if screenshot_ts changed
+      if (s.has_screenshot && s.screenshot_ts !== _watchShotTs[s.slot_idx]) {
+        _watchShotTs[s.slot_idx] = s.screenshot_ts;
+        let img = el.querySelector(`[data-slot-shot="${s.slot_idx}"]`);
+        if (img) {
+          img.src = `/api/link/watch/slot/${s.slot_idx}/screenshot?t=${s.screenshot_ts}`;
+        } else {
+          // Replace no-shot placeholder with img
+          const placeholder = el.querySelector('.watch-slot-no-shot');
+          if (placeholder) {
+            const newImg = document.createElement('img');
+            newImg.className = 'watch-slot-shot';
+            newImg.dataset.slotShot = s.slot_idx;
+            newImg.alt = 'screenshot';
+            newImg.src = `/api/link/watch/slot/${s.slot_idx}/screenshot?t=${s.screenshot_ts}`;
+            placeholder.replaceWith(newImg);
+          }
+        }
+      }
+
+      // Update action buttons if isDone status changed
       const isDone = ['done', 'failed', 'off'].includes(s.status);
-      const shotUrl = s.has_screenshot
-        ? `/api/link/watch/slot/${s.slot_idx}/screenshot?t=${s.screenshot_ts}`
-        : '';
-      const copyImgBtn = s.has_screenshot
-        ? `<button class="btn btn-ghost btn-small" data-watch-copy="${s.slot_idx}" title="Copy screenshot + email">📋 Copy</button>`
-        : '';
-      const actionBtns = `
-        <div class="watch-slot-actions">
-          ${copyImgBtn}
-          ${!isDone ? `
-          <button class="btn btn-ghost btn-small" data-watch-action="done" data-slot="${s.slot_idx}">✅ Done</button>
-          <button class="btn btn-ghost btn-small" data-watch-action="fail" data-slot="${s.slot_idx}">❌ Fail</button>
-          <button class="btn btn-ghost btn-small" data-watch-action="off"  data-slot="${s.slot_idx}">🔴 Off</button>
-          ` : ''}
-        </div>`;
-      return `<div class="watch-slot">
-        <div class="watch-slot-header">
-          <span class="watch-slot-idx">${s.slot_idx + 1}</span>
-          <span class="watch-slot-email" title="${escHtml(s.email)}">${escHtml(s.email)}</span>
-          <span class="watch-slot-status" style="color:${color}">${label}</span>
-        </div>
-        <div class="watch-slot-msg muted">${escHtml(s.status_msg)}</div>
-        ${shotUrl ? `<img class="watch-slot-shot" src="${escHtml(shotUrl)}" alt="screenshot">` : '<div class="watch-slot-no-shot muted">No screenshot yet</div>'}
-        ${actionBtns}
-      </div>`;
-    }).join('');
+      const actionsEl = el.querySelector('.watch-slot-actions');
+      if (actionsEl) {
+        const hasActionBtns = !!actionsEl.querySelector('[data-watch-action]');
+        if (isDone && hasActionBtns) {
+          // Remove action buttons, keep copy btn
+          actionsEl.querySelectorAll('[data-watch-action]').forEach((b) => b.remove());
+        }
+        // Add copy btn if screenshot just appeared
+        if (s.has_screenshot && !actionsEl.querySelector('[data-watch-copy]')) {
+          const copyBtn = document.createElement('button');
+          copyBtn.className = 'btn btn-ghost btn-small';
+          copyBtn.dataset.watchCopy = s.slot_idx;
+          copyBtn.title = 'Copy screenshot + email';
+          copyBtn.textContent = '📋 Copy';
+          actionsEl.insertBefore(copyBtn, actionsEl.firstChild);
+        }
+      }
+    });
   }
 
   async function copyWatchSlotImage(slotIdx) {
@@ -415,19 +482,28 @@
     }
   }
 
+  // Track per-slot screenshot_ts to avoid reloading unchanged images
+  const _watchShotTs = {};
+  let _watchPollActive = false;
+
   async function pollWatchStatus() {
+    if (!state.watch.active) return;
+    _watchPollActive = true;
     try {
       const data = await api('/api/link/watch/status');
+      if (!state.watch.active) return; // closed while fetching
       state.watch.slots = data.slots || [];
       renderWatchPanel();
     } catch (err) {
       console.error('[watch poll]', err.message);
+    } finally {
+      _watchPollActive = false;
     }
   }
 
   function startWatchPolling() {
     if (state.watch.pollInterval) return;
-    state.watch.pollInterval = setInterval(pollWatchStatus, 3000);
+    state.watch.pollInterval = setInterval(pollWatchStatus, 5000);
   }
 
   function stopWatchPolling() {
@@ -435,6 +511,7 @@
       clearInterval(state.watch.pollInterval);
       state.watch.pollInterval = null;
     }
+    state.watch.active = false;
   }
 
   function openWatchPicker() {
@@ -469,8 +546,15 @@
 
   dom.btnWatch.addEventListener('click', openWatchPicker);
 
-  dom.watchPickerCancel.addEventListener('click', () => {
+  function closeWatchPicker() {
     dom.watchPicker.style.display = 'none';
+    renderJobs(); // flush any pending job updates
+  }
+
+  dom.watchPickerCancel.addEventListener('click', closeWatchPicker);
+  // Click backdrop (outside inner box) to close
+  dom.watchPicker.addEventListener('click', (e) => {
+    if (e.target === dom.watchPicker) closeWatchPicker();
   });
 
   dom.watchPickerStart.addEventListener('click', async () => {
@@ -519,9 +603,8 @@
   });
 
   dom.watchClose.addEventListener('click', () => {
-    stopWatchPolling();
-    state.watch.active = false;
-    renderWatchPanel();
+    stopWatchPolling(); // sets active = false + clears interval
+    dom.watchPanel.style.display = 'none';
   });
 
   // Watch slot action buttons (event delegation on watch slots container)
@@ -786,6 +869,7 @@
   qrModalClose.addEventListener('click', closeQrModal);
   qrModalBackdrop.addEventListener('click', closeQrModal);
   document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && isPickerOpen()) { closeWatchPicker(); return; }
     if (e.key === 'Escape' && !qrModal.classList.contains('hidden')) closeQrModal();
     if (e.key === 'Escape' && !shotModal.classList.contains('hidden')) closeShotModal();
   });
