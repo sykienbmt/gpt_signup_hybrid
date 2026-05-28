@@ -905,6 +905,84 @@ async def upi_fill_job(job_id: str) -> JSONResponse:
     return JSONResponse(result)
 
 
+@app.post("/api/link/jobs/{job_id}/check-plus")
+async def check_plus(job_id: str) -> JSONResponse:
+    """Check xem account đã có ChatGPT Plus chưa, dùng access_token của job."""
+    from curl_cffi.requests import AsyncSession as CurlSession
+
+    lm = get_link_manager()
+    job = lm.jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    token = job._access_token
+    if not token:
+        raise HTTPException(422, "no access_token for this job")
+
+    try:
+        async with CurlSession(impersonate="chrome136") as s:
+            r = await s.get(
+                "https://chatgpt.com/backend-api/me",
+                headers={"Authorization": f"Bearer {token}", "Accept": "*/*"},
+                timeout=15.0,
+            )
+        if r.status_code != 200:
+            return JSONResponse({"is_plus": False, "error": f"HTTP {r.status_code}"})
+        data = r.json()
+        plan = data.get("plan_type") or ""
+        is_plus = plan.lower() in ("plus", "team", "pro")
+        if not is_plus:
+            for org in (data.get("orgs") or {}).get("data", []):
+                if org.get("plan_type", "").lower() in ("plus", "team", "pro"):
+                    is_plus = True
+                    plan = org["plan_type"]
+                    break
+        return JSONResponse({"is_plus": is_plus, "plan": plan, "email": data.get("email", "")})
+    except Exception as e:
+        return JSONResponse({"is_plus": False, "error": str(e)})
+
+
+@app.post("/api/link/jobs/{job_id}/check-payment")
+async def check_payment_link(job_id: str) -> JSONResponse:
+    """Check payment: checkout_not_active_session = đã thanh toán xong."""
+    from curl_cffi.requests import AsyncSession as CurlSession
+
+    lm = get_link_manager()
+    job = lm.jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    if not job.checkout_session_id or not job.publishable_key:
+        raise HTTPException(422, "job missing checkout_session_id / publishable_key")
+
+    url = f"https://api.stripe.com/v1/payment_pages/{job.checkout_session_id}/init"
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/x-www-form-urlencoded",
+        "origin": "https://pay.openai.com",
+        "referer": "https://pay.openai.com/",
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+    }
+    data = {
+        "key": job.publishable_key,
+        "eid": "NA",
+        "browser_locale": "vi-VN",
+        "browser_timezone": "Asia/Saigon",
+        "redirect_type": "url",
+    }
+    try:
+        async with CurlSession(impersonate="chrome136") as s:
+            r = await s.post(url, headers=headers, data=data, timeout=15.0)
+        body = r.json()
+        err_code = (body.get("error") or {}).get("code") or ""
+        if err_code == "checkout_not_active_session":
+            return JSONResponse({"paid": True, "reason": "session_inactive"})
+        pi_status = (body.get("payment_intent") or {}).get("status") or ""
+        sub_status = (body.get("subscription") or {}).get("status") or ""
+        paid = pi_status == "succeeded" or sub_status in ("active", "trialing")
+        return JSONResponse({"paid": paid, "pi_status": pi_status, "sub_status": sub_status})
+    except Exception as e:
+        return JSONResponse({"paid": False, "error": str(e)})
+
+
 class CheckAccountRequest(BaseModel):
     lines: str = Field(default="")
     max_concurrent: int = Field(default=5, ge=1, le=10)

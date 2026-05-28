@@ -29,6 +29,8 @@
     // UPI payment polling: jobId → intervalId (null = stopped)
     upiPolling: new Map(),
     upiPaid: new Set(),
+    plusResults: new Map(),  // jobId → {checking, is_plus, plan, error}
+    payResults: new Map(),   // jobId → {checking, paid, reason, error}
     // Watch mode
     watch: {
       active: false,
@@ -203,6 +205,16 @@
               );
             }
           }
+        }
+      }
+      if (job.status === 'success') {
+        const pr = state.plusResults.get(id);
+        const plLabel = !pr ? '✦ Plus?' : pr.checking ? '⏳' : pr.is_plus ? `✅ ${escHtml(pr.plan||'Plus')}` : '❌ No Plus';
+        actions.push(`<button class="icon-btn" data-action="check-plus" data-id="${escHtml(id)}" title="Check ChatGPT Plus" ${pr?.checking?'disabled':''}>${plLabel}</button>`);
+        if (job.checkout_session_id) {
+          const py = state.payResults.get(id);
+          const pyLabel = !py ? '💳?' : py.checking ? '⏳' : py.paid ? '✅ Paid' : '❌ Unpaid';
+          actions.push(`<button class="icon-btn" data-action="check-payment" data-id="${escHtml(id)}" title="Check payment status" ${py?.checking?'disabled':''}>${pyLabel}</button>`);
         }
       }
       if (job.status === 'running') {
@@ -753,6 +765,20 @@
             state.upiInProgress.delete(id);
             renderJobs();
           });
+      } else if (action === 'check-plus') {
+        state.plusResults.set(id, { checking: true });
+        renderJobs();
+        api(`/api/link/jobs/${id}/check-plus`, { method: 'POST' })
+          .then((res) => state.plusResults.set(id, { ...res, checking: false }))
+          .catch((err) => state.plusResults.set(id, { checking: false, is_plus: false, error: err.message }))
+          .finally(() => renderJobs());
+      } else if (action === 'check-payment') {
+        state.payResults.set(id, { checking: true });
+        renderJobs();
+        api(`/api/link/jobs/${id}/check-payment`, { method: 'POST' })
+          .then((res) => state.payResults.set(id, { ...res, checking: false }))
+          .catch((err) => state.payResults.set(id, { checking: false, paid: false, error: err.message }))
+          .finally(() => renderJobs());
       } else if (action === 'upi-start-poll') {
         startUpiPolling(id);
       } else if (action === 'upi-stop-poll') {
