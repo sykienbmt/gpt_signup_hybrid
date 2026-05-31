@@ -22,39 +22,33 @@ SlotStatus = Literal[
 
 _SHOT_DIR = Path(__file__).resolve().parent.parent / "runtime" / "upi_watch_shots"
 
-# JS injected into the page — uses expose_function "watchAction"
+# JS injected into the page. Clicking a button sets `window.__gwAction`, which
+# Python polls — far more reliable in Camoufox headed mode than expose_function
+# (which often fails to bind, leaving the overlay buttons dead). Re-injectable:
+# removes any stale overlay first so it survives page reloads.
 _OVERLAY_JS = r"""
 () => {
-  if (document.getElementById('_gw_ov')) return;
+  const old = document.getElementById('_gw_ov');
+  if (old) old.remove();
+  window.__gwAction = null;
   const d = document.createElement('div');
   d.id = '_gw_ov';
-  d.style.cssText = 'position:fixed;top:8px;right:8px;z-index:2147483647;display:flex;gap:6px;font-family:system-ui,sans-serif;';
+  d.style.cssText = 'position:fixed;top:8px;right:8px;z-index:2147483647;display:flex;gap:8px;font-family:system-ui,sans-serif;';
   const mk = (t, bg) => {
     const b = document.createElement('button');
     b.textContent = t;
-    b.style.cssText = `background:${bg};color:#fff;border:none;padding:8px 14px;border-radius:8px;font-size:14px;font-weight:700;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.4)`;
+    b.style.cssText = `background:${bg};color:#fff;border:none;padding:10px 16px;border-radius:8px;font-size:15px;font-weight:700;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.45)`;
     return b;
   };
-  const done = mk('✅ Done','#22c55e'), fail = mk('❌ Fail','#ef4444'), off = mk('🔴 Off','#6b7280');
-  done.onclick = () => { done.disabled=true; window.watchAction('done'); };
-  fail.onclick = () => { fail.disabled=true; window.watchAction('fail'); };
-  off.onclick  = () => { off.disabled=true;  window.watchAction('off');  };
-  d.append(done, fail, off);
-  document.body.appendChild(d);
-}
-"""
-
-_OFF_ONLY_JS = r"""
-() => {
-  if (document.getElementById('_gw_ov')) return;
-  const d = document.createElement('div');
-  d.id = '_gw_ov';
-  d.style.cssText = 'position:fixed;top:8px;right:8px;z-index:2147483647;font-family:system-ui,sans-serif;';
-  const b = document.createElement('button');
-  b.textContent = '🔴 Off';
-  b.style.cssText = 'background:#6b7280;color:#fff;border:none;padding:8px 14px;border-radius:8px;font-size:14px;font-weight:700;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.4)';
-  b.onclick = () => { b.disabled=true; window.watchAction('off'); };
-  d.appendChild(b);
+  const done = mk('✅ Done','#22c55e');
+  const fail = mk('❌ Fail','#ef4444');
+  const reload = mk('🔄 Reload','#3b82f6');
+  const off = mk('🔴 Off','#6b7280');
+  done.onclick = () => { window.__gwAction = 'done'; done.disabled = true; };
+  fail.onclick = () => { window.__gwAction = 'fail'; fail.disabled = true; };
+  reload.onclick = () => { window.__gwAction = 'reload'; };
+  off.onclick = () => { window.__gwAction = 'off'; off.disabled = true; };
+  d.append(done, fail, reload, off);
   document.body.appendChild(d);
 }
 """
@@ -166,6 +160,22 @@ class UpiWatchManager:
         except Exception:
             pass
 
+    async def _next_action(self, page, slot: WatchSlot) -> str | None:
+        """Return a pending action from the web UI or the in-browser overlay."""
+        # Web UI action (Done / Fail / Off / Reload from the panel)
+        if slot._action_event.is_set():
+            slot._action_event.clear()
+            act = slot._pending_action
+            slot._pending_action = None
+            return act
+        # In-browser overlay action — poll & consume the sentinel
+        try:
+            return await page.evaluate(
+                "() => { const a = window.__gwAction; window.__gwAction = null; return a || null; }"
+            )
+        except Exception:
+            return None
+
     async def _run_slot(self, slot: WatchSlot) -> None:
         from camoufox.async_api import AsyncCamoufox
         from .upi_automation import (
@@ -177,9 +187,12 @@ class UpiWatchManager:
             generate_indian_address,
         )
 
-        WIN_W, WIN_H = 500, 540
-        WIN_X = 40
-        WIN_Y = slot.slot_idx * (WIN_H + 30)
+        # Tall windows laid out left→right across the screen so 3 browsers don't
+        # overlap (slot 0 leftmost). Height is ~2× the previous 540.
+        WIN_W, WIN_H = 520, 1040
+        GAP = 16
+        WIN_X = 20 + slot.slot_idx * (WIN_W + GAP)
+        WIN_Y = 0
 
         cf = AsyncCamoufox(headless=False, window=(WIN_W, WIN_H))
         try:
@@ -198,18 +211,11 @@ class UpiWatchManager:
             except Exception:
                 pass
 
-            # Position window on screen (Firefox supports window.moveTo)
+            # Position + size the window on screen (Firefox supports window.moveTo)
             try:
                 await page.evaluate(f"window.moveTo({WIN_X},{WIN_Y}); window.resizeTo({WIN_W},{WIN_H})")
             except Exception:
                 pass
-
-            # Expose action callback so overlay buttons can signal Python
-            async def _overlay_action(action: str) -> None:
-                slot._pending_action = action
-                slot._action_event.set()
-
-            await page.expose_function("watchAction", _overlay_action)
 
             # Navigate
             slot.status = "navigating"
@@ -221,95 +227,79 @@ class UpiWatchManager:
                 pass
             await asyncio.sleep(2)
 
-            if slot._action_event.is_set():
-                await self._finish(slot)
-                return
-
-            # Fill UPI
-            slot.status = "filling"
-            slot.status_msg = "Waiting for UPI accordion…"
-            appeared = await _wait_for_upi_accordion(page, timeout_ms=20_000)
-
-            if not appeared or slot._action_event.is_set():
-                slot.status = "error"
-                slot.status_msg = "UPI accordion not found"
-                try:
-                    await page.evaluate(_OFF_ONLY_JS)
-                except Exception:
-                    pass
-                await slot._action_event.wait()
-            else:
-                await _click_upi_accordion(page)
-                await asyncio.sleep(1.5)
-                addr = generate_indian_address()
-                await _fill_upi_billing(page, addr)
-                await asyncio.sleep(0.8)
-                await _check_required_checkboxes(page)
-                await asyncio.sleep(0.5)
-
-                slot.status = "submitting"
-                slot.status_msg = "Clicking subscribe…"
-                await _click_subscribe(page)
-
-                # Wait for QR — retry subscribe if no QR after 10s (button sometimes unresponsive)
-                slot.status = "waiting_qr"
-                slot.status_msg = "Waiting for QR code…"
-                qr_sel = (
-                    'img[data-testid="QRCode-image"], img.QRCode-image,'
-                    ' img[src*="qr.stripe.com"]'
-                )
-                qr_found = False
-                _RETRY_INTERVAL = 10.0   # retry subscribe every 10s if no QR
-                _MAX_RETRIES = 3
-                _retry_count = 0
-                deadline = time.monotonic() + 40.0
-                _next_retry_at = time.monotonic() + _RETRY_INTERVAL
-                while time.monotonic() < deadline and not slot._action_event.is_set():
-                    for frame in page.frames:
-                        try:
-                            el = await frame.query_selector(qr_sel)
-                            if el:
-                                qr_found = True
-                                break
-                        except Exception:
-                            continue
-                    if qr_found:
-                        break
-                    # Retry subscribe if no QR after RETRY_INTERVAL seconds
-                    if (time.monotonic() >= _next_retry_at
-                            and _retry_count < _MAX_RETRIES
-                            and not slot._action_event.is_set()):
-                        _retry_count += 1
-                        slot.status_msg = f"No QR — retrying subscribe (attempt {_retry_count}/{_MAX_RETRIES})…"
-                        await _click_subscribe(page)
-                        _next_retry_at = time.monotonic() + _RETRY_INTERVAL
+            if not slot._action_event.is_set():
+                # Fill UPI (single pass — no background retry loop)
+                slot.status = "filling"
+                slot.status_msg = "Waiting for UPI accordion…"
+                appeared = await _wait_for_upi_accordion(page, timeout_ms=20_000)
+                if appeared:
+                    await _click_upi_accordion(page)
+                    await asyncio.sleep(1.5)
+                    addr = generate_indian_address()
+                    await _fill_upi_billing(page, addr)
+                    await asyncio.sleep(0.8)
+                    await _check_required_checkboxes(page)
                     await asyncio.sleep(0.5)
+                    slot.status = "submitting"
+                    slot.status_msg = "Clicking subscribe…"
+                    await _click_subscribe(page)
 
-                if slot._action_event.is_set():
-                    pass  # early exit
-                elif qr_found:
-                    slot.status = "qr_visible"
-                    slot.status_msg = "QR visible — waiting for payment"
-                    await asyncio.sleep(5.0)  # let QR fully render
-                    try:
-                        await page.evaluate(_OVERLAY_JS)
-                    except Exception:
-                        pass
-                    await self._take_screenshot(slot, page)
-                    # Keep alive + periodic screenshots
-                    while not slot._action_event.is_set():
-                        await asyncio.sleep(3.0)
-                        if not slot._action_event.is_set():
-                            await self._take_screenshot(slot, page)
+                    # Passive wait for the QR (no auto-retry). User can Reload.
+                    slot.status = "waiting_qr"
+                    slot.status_msg = "Waiting for QR code…"
+                    qr_sel = (
+                        'img[data-testid="QRCode-image"], img.QRCode-image,'
+                        ' img[src*="qr.stripe.com"]'
+                    )
+                    qr_found = False
+                    deadline = time.monotonic() + 15.0
+                    while time.monotonic() < deadline and not slot._action_event.is_set():
+                        for frame in page.frames:
+                            try:
+                                if await frame.query_selector(qr_sel):
+                                    qr_found = True
+                                    break
+                            except Exception:
+                                continue
+                        if qr_found:
+                            break
+                        await asyncio.sleep(0.5)
+                    if qr_found:
+                        await asyncio.sleep(3.0)  # let QR fully render
+                        slot.status = "qr_visible"
+                        slot.status_msg = "QR visible — pay, then Reload to check"
+                    else:
+                        slot.status = "error"
+                        slot.status_msg = "QR not detected — Reload to retry"
                 else:
                     slot.status = "error"
-                    slot.status_msg = "QR not found within 40s"
+                    slot.status_msg = "UPI accordion not found — Reload to retry"
+
+            # Inject overlay (Done / Fail / Reload / Off) and enter manual loop.
+            # No background screenshots — the user drives via the buttons.
+            try:
+                await page.evaluate(_OVERLAY_JS)
+            except Exception:
+                pass
+            await self._take_screenshot(slot, page)
+
+            while True:
+                act = await self._next_action(page, slot)
+                if act == "reload":
+                    slot.status_msg = "Reloading page…"
                     try:
-                        await page.evaluate(_OFF_ONLY_JS)
-                    except Exception:
-                        pass
+                        await page.reload(wait_until="domcontentloaded", timeout=60_000)
+                        await asyncio.sleep(1.5)
+                        await page.evaluate(_OVERLAY_JS)
+                        slot.status_msg = "Reloaded — check browser window"
+                    except Exception as exc:
+                        slot.status_msg = f"Reload failed: {str(exc)[:60]}"
                     await self._take_screenshot(slot, page)
-                    await slot._action_event.wait()
+                    continue
+                if act in ("done", "fail", "off"):
+                    slot._pending_action = act
+                    break
+                await asyncio.sleep(0.5)
 
             await self._finish(slot)
 

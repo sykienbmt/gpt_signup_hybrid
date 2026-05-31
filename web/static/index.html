@@ -19,6 +19,7 @@
     <button class="tab-btn" data-tab="link">Get Link</button>
     <button class="tab-btn" data-tab="check">Check Account</button>
     <button class="tab-btn" data-tab="check-payment">Check Payment</button>
+    <button class="tab-btn" data-tab="change-password">Change Pass</button>
   </nav>
   <div class="topbar-actions">
     <label class="select-wrap">
@@ -47,6 +48,11 @@
 <!-- ════════════════ PROXY STRIP (global) ════════════════ -->
 <section class="proxy-strip" id="proxy-strip">
   <div class="proxy-strip-inner">
+    <label class="toggle-wrap" title="Enable or disable proxy for all operations">
+      <input type="checkbox" id="proxy-enabled-toggle" checked />
+      <span class="toggle-track"><span class="toggle-thumb"></span></span>
+      <span class="toggle-label">Proxy</span>
+    </label>
     <label class="proxy-input-group">
       <span class="proxy-icon" aria-hidden="true">🌐</span>
       <input
@@ -64,6 +70,34 @@
       <span class="proxy-status-label">direct</span>
     </span>
     <span id="proxy-status-detail" class="proxy-status-detail muted"></span>
+  </div>
+  <div class="proxy-strip-inner proxy-rotate-inner">
+    <label class="toggle-wrap" title="Automatically call rotate URL/curl on interval">
+      <input type="checkbox" id="proxy-rotate-toggle" />
+      <span class="toggle-track"><span class="toggle-thumb"></span></span>
+      <span class="toggle-label">Auto rotate</span>
+    </label>
+    <label class="proxy-input-group proxy-rotate-command">
+      <span class="proxy-icon" aria-hidden="true">↻</span>
+      <input
+        type="text"
+        id="proxy-rotate-command"
+        placeholder="rotate URL or curl command"
+        spellcheck="false"
+        autocomplete="off"
+      />
+    </label>
+    <label class="input-group proxy-rotate-interval">
+      <span class="input-label">Every</span>
+      <input type="number" id="proxy-rotate-interval" value="300" min="10" max="86400" step="10" />
+    </label>
+    <button id="btn-proxy-rotate-now" class="btn btn-ghost btn-small" type="button">Rotate now</button>
+    <button id="btn-proxy-rotate-save" class="btn btn-ghost btn-small" type="button">Save rotate</button>
+    <span id="proxy-rotate-status" class="proxy-status proxy-status-idle">
+      <span class="proxy-dot"></span>
+      <span class="proxy-status-label">off</span>
+    </span>
+    <span id="proxy-rotate-detail" class="proxy-status-detail muted"></span>
   </div>
 </section>
 
@@ -372,6 +406,13 @@
     <textarea id="cp-input" class="combo-textarea"
       placeholder="Paste session JSON objects or accessToken strings (one per line)&#10;&#10;Examples:&#10;eyJhbGci...  (raw accessToken)&#10;{&quot;accessToken&quot;:&quot;eyJ...&quot;, &quot;email&quot;:&quot;user@example.com&quot;}"></textarea>
     <div class="card-actions">
+      <label class="select-wrap" style="margin-right:8px">
+        <span class="muted" style="font-size:11px;margin-right:4px">Input</span>
+        <select id="cp-mode">
+          <option value="token" selected>Session / Token</option>
+          <option value="combo">Combo (email|pass|2fa)</option>
+        </select>
+      </label>
       <label class="select-wrap" style="margin-right:auto">
         <span class="muted" style="font-size:11px;margin-right:4px">Region</span>
         <select id="cp-region">
@@ -392,6 +433,7 @@
         </select>
       </label>
       <button id="cp-btn-run" class="btn btn-primary">▶ Check</button>
+      <button id="cp-btn-end" class="btn btn-ghost btn-small" style="display:none">⏹ End</button>
     </div>
   </section>
 
@@ -399,7 +441,8 @@
     <header class="card-head">
       <h2>Results</h2>
       <span class="muted" id="cp-summary"></span>
-      <button id="cp-btn-clear-results" class="btn btn-ghost btn-small" style="margin-left:8px">Clear</button>
+      <button id="cp-btn-export" class="btn btn-ghost btn-small" style="margin-left:8px">⬇ Export</button>
+      <button id="cp-btn-clear-results" class="btn btn-ghost btn-small" style="margin-left:4px">Clear</button>
     </header>
     <div id="cp-result-list" class="job-list" style="flex:1;min-height:0;padding:4px 6px">
       <div class="empty">Paste sessions and click Check.</div>
@@ -410,6 +453,63 @@
         <button id="cp-log-close" class="icon-btn" title="Close log" style="margin-left:auto">✕</button>
       </div>
       <pre id="cp-log-body" style="margin:0;padding:8px 16px 12px;font-size:11px;line-height:1.6;white-space:pre-wrap;word-break:break-all;max-height:160px;overflow-y:auto;background:var(--bg-secondary,var(--bg))"></pre>
+    </div>
+  </section>
+</main>
+
+<!-- ════════════════ TAB: CHANGE PASSWORD ════════════════ -->
+<main class="grid grid-check tab-content" id="tab-change-password">
+  <section class="card card-input">
+    <header class="card-head">
+      <h2>Change Password</h2>
+      <span class="muted card-head-note">email|pass|2fa  hoặc  email|pass|2fa|session</span>
+    </header>
+    <textarea id="cp2-input" class="combo-textarea combo-textarea-nowrap" wrap="off" spellcheck="false"
+      placeholder="user@hotmail.com|CurrentPass123|TOTP_SECRET&#10;user2@gmail.com|OldPass456|JBSWY3DPEHPK3PXP|{&quot;accessToken&quot;:&quot;eyJ...&quot;}"></textarea>
+    <div class="card-settings">
+      <div class="card-settings-row card-settings-row-mixed">
+        <label class="input-group config-field-long">
+          <span class="input-label">New password</span>
+          <input type="text" id="cp2-new-pass" placeholder="Leave blank to use Random" autocomplete="off" spellcheck="false" />
+        </label>
+        <label class="toggle-wrap" title="Generate a random new password per account">
+          <input type="checkbox" id="cp2-random-pass" />
+          <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          <span class="toggle-label">Random</span>
+        </label>
+        <label class="select-wrap">
+          <span class="muted" style="font-size:11px;margin-right:4px">Parallel</span>
+          <select id="cp2-parallel">
+            <option value="1" selected>1</option>
+            <option value="2">2</option>
+            <option value="3">3</option>
+          </select>
+        </label>
+      </div>
+    </div>
+    <div class="card-actions">
+      <button id="cp2-btn-run" class="btn btn-primary">▶ Change Password</button>
+      <button id="cp2-btn-end" class="btn btn-ghost btn-small" style="display:none">⏹ End</button>
+      <button id="cp2-btn-clear" class="btn btn-ghost">Clear Input</button>
+      <span class="muted" id="cp2-count">0 combos</span>
+    </div>
+  </section>
+
+  <section class="card card-jobs" style="display:flex;flex-direction:column">
+    <header class="card-head">
+      <h2>Results</h2>
+      <span class="muted" id="cp2-summary"></span>
+      <button id="cp2-btn-export" class="btn btn-ghost btn-small" style="margin-left:8px">⬇ Export</button>
+    </header>
+    <div id="cp2-result-list" class="job-list" style="flex:1;min-height:0;padding:4px 6px">
+      <div class="empty">Paste combos and click Change Password.</div>
+    </div>
+    <div id="cp2-log-panel" style="display:none;border-top:1px solid var(--border);flex-shrink:0">
+      <div class="card-head" style="padding:8px 16px;min-height:unset">
+        <span style="font-size:12px;font-weight:600">📋 Log — <span id="cp2-log-label" class="muted"></span></span>
+        <button id="cp2-log-close" class="icon-btn" style="margin-left:auto">✕</button>
+      </div>
+      <pre id="cp2-log-body" style="margin:0;padding:8px 16px 12px;font-size:11px;line-height:1.6;white-space:pre-wrap;word-break:break-all;max-height:200px;overflow-y:auto;background:var(--bg-secondary,var(--bg))"></pre>
     </div>
   </section>
 </main>
@@ -460,5 +560,6 @@
 <script src="/static/link.js?v=__ASSET_VERSION__"></script>
 <script src="/static/check.js?v=__ASSET_VERSION__"></script>
 <script src="/static/check-payment.js?v=__ASSET_VERSION__"></script>
+<script src="/static/change-password.js?v=__ASSET_VERSION__"></script>
 </body>
 </html>

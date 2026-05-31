@@ -845,6 +845,41 @@ body {
 }
 .shot-copy-btn:hover { opacity: 1; }
 
+/* Screenshot chips — each shot is a bordered pill, visually separated. */
+.job-shots {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 4px;
+}
+.shot-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: rgba(0,0,0,0.025);
+  font-size: 11px;
+  line-height: 1.4;
+}
+.shot-chip-label {
+  color: var(--fg-dim);
+  text-decoration: none;
+  padding: 0 4px 0 0;
+}
+.shot-chip-label:hover { color: var(--blue); text-decoration: underline; }
+.shot-chip-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 0 3px;
+  font-size: 12px;
+  opacity: 0.75;
+  border-radius: 3px;
+}
+.shot-chip-btn:hover { opacity: 1; background: rgba(0,0,0,0.08); }
+
 .job-duration {
   font-family: var(--font-mono);
   font-size: 11px;
@@ -1103,6 +1138,24 @@ body {
   border-radius: var(--radius-sm);
   padding: 0 10px;
   transition: border-color 0.12s;
+}
+
+.proxy-rotate-inner {
+  border-top: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  padding-top: 6px;
+}
+
+.proxy-rotate-command {
+  flex-basis: 460px;
+}
+
+.proxy-rotate-interval {
+  flex: 0 0 92px;
+  min-width: 92px;
+}
+
+.proxy-rotate-interval input {
+  width: 84px;
 }
 
 .proxy-input-group:focus-within {
@@ -1599,5 +1652,120 @@ body {
   display: flex;
   gap: 8px;
   justify-content: flex-end;
+}
+
+/* ── Change Password tab ───────────────────────────────── */
+.cp2-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  margin-bottom: 4px;
+  font-size: 13px;
+  flex-wrap: wrap;
+}
+
+.cp2-status { flex-shrink: 0; width: 20px; text-align: center; }
+.cp2-row .email-copy { font-family: var(--font-mono); font-size: 12px; cursor: pointer; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cp2-row .email-copy:hover { color: var(--accent); text-decoration: underline; }
+
+.cp2-new-pass-badge {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  background: var(--green-dim);
+  color: var(--green);
+  border: 1px solid var(--green);
+  border-radius: 4px;
+  padding: 2px 6px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.cp2-new-pass-badge:hover { opacity: 0.8; }
+
+.cp2-session-badge {
+  font-size: 11px;
+  background: rgba(96, 165, 250, 0.15);
+  color: var(--blue);
+  border: 1px solid var(--blue);
+  border-radius: 4px;
+  padding: 2px 6px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.cp2-session-badge:hover { opacity: 0.8; }
+
+.cp2-error-msg { font-size: 11px; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cp2-actions { display: flex; gap: 4px; flex-shrink: 0; }
+
+/* Log modal for change-password */
+.cp2-log-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 1100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.cp2-log-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0,0,0,0.65);
+}
+.cp2-log-box {
+  position: relative;
+  z-index: 1;
+  background: var(--bg-elev);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  width: min(640px, 92vw);
+  max-height: 70vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.cp2-log-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  font-weight: 600;
+  font-size: 13px;
+}
+.cp2-log-body {
+  margin: 0;
+  padding: 12px 16px;
+  font-size: 11px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-all;
+  overflow-y: auto;
+  flex: 1;
+  color: var(--fg-mute);
+}
+
+/* Flash message toast */
+.flash-msg {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border-strong);
+  color: var(--fg);
+  padding: 8px 18px;
+  border-radius: 20px;
+  font-size: 13px;
+  z-index: 9999;
+  pointer-events: none;
+  animation: fadeInOut 2.2s ease forwards;
+}
+@keyframes fadeInOut {
+  0%   { opacity: 0; transform: translateX(-50%) translateY(8px); }
+  15%  { opacity: 1; transform: translateX(-50%) translateY(0); }
+  75%  { opacity: 1; }
+  100% { opacity: 0; }
 }
 

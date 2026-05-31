@@ -36,6 +36,7 @@
     currentMailMode: 'outlook',
     proxy: null,              // proxy URL hiện active (từ server)
     proxyEditing: false,      // user đang gõ vào input → đừng overwrite từ SSE
+    proxyRotateEditing: false,
     successTab: 'basic',      // 'basic' | 'with-session'
   };
 
@@ -79,12 +80,21 @@
     btnRecheck:        $('btn-recheck'),
     recheckStatus:     $('recheck-status'),
     // Proxy strip
+    proxyEnabledToggle: $('proxy-enabled-toggle'),
     proxyInput:        $('proxy-input'),
     btnProxyTest:      $('btn-proxy-test'),
     btnProxySave:      $('btn-proxy-save'),
     proxyStatus:       $('proxy-status'),
     proxyStatusLabel:  document.querySelector('#proxy-status .proxy-status-label'),
     proxyStatusDetail: $('proxy-status-detail'),
+    proxyRotateToggle: $('proxy-rotate-toggle'),
+    proxyRotateCommand: $('proxy-rotate-command'),
+    proxyRotateInterval: $('proxy-rotate-interval'),
+    btnProxyRotateNow: $('btn-proxy-rotate-now'),
+    btnProxyRotateSave: $('btn-proxy-rotate-save'),
+    proxyRotateStatus: $('proxy-rotate-status'),
+    proxyRotateStatusLabel: document.querySelector('#proxy-rotate-status .proxy-status-label'),
+    proxyRotateDetail: $('proxy-rotate-detail'),
   };
 
   // ── Helpers ───────────────────────────────────────────────────────
@@ -237,12 +247,24 @@
       if (j.payment_link) {
         postRegBtns += `<button class="icon-btn" data-action="copy-link" data-id="${escHtml(id)}" title="Copy payment link">${icon('link')}</button>`;
       }
+      let payBadge = '';
+      if (j.payment_status === 'not_free') {
+        const amt = (j.payment_amount && j.payment_amount > 0)
+          ? `${(j.payment_amount / 100).toFixed(2)} ${j.payment_currency || ''}`
+          : 'paid';
+        payBadge = `<span class="badge-mode" style="background:#fde2e2;color:#b42318" title="Trial không còn — không free">💳 ${escHtml(amt)}</span>`;
+      } else if (j.payment_status === 'free') {
+        const days = j.payment_trial_days ? ` ${j.payment_trial_days}d` : '';
+        payBadge = `<span class="badge-mode" style="background:#dcfce7;color:#15803d" title="Free trial available">✅ free${escHtml(days)}</span>`;
+      } else if (j.payment_status === 'check_failed') {
+        payBadge = `<span class="badge-mode" style="background:#fef3c7;color:#92400e" title="Payment check failed">? check</span>`;
+      }
       return `
         <div class="${cls}" data-id="${escHtml(id)}">
           <div class="job-index">${idx + 1}</div>
           <div class="job-status status-${escHtml(j.status)}">${escHtml(j.status)}</div>
           <div class="job-main">
-            <div class="job-email" title="${escHtml(j.email)}">${escHtml(j.email)}<span class="badge-mode badge-mode-${escHtml(j.mail_mode || 'outlook')}">${escHtml(j.mail_mode || 'outlook')}</span></div>
+            <div class="job-email" title="${escHtml(j.email)}">${escHtml(j.email)}<span class="badge-mode badge-mode-${escHtml(j.mail_mode || 'outlook')}">${escHtml(j.mail_mode || 'outlook')}</span>${payBadge}</div>
           </div>
           <div class="job-duration">${escHtml(fmtDuration(j.duration))}</div>
           <div class="job-actions">
@@ -341,14 +363,20 @@
       const sec = secrets.secret || '';
 
       if (j.status === 'success') {
-        const base = `${j.email}|${pw}|${sec}`;
-        if (state.successTab === 'with-session') {
-          if (j.session_data) {
-            successLines.push(`${base}|${JSON.stringify(j.session_data)}`);
-          }
-          // jobs without session_data are omitted until fetched
+        // Skip not-free accounts: still shown in job list with badge,
+        // but excluded from the aggregated success output.
+        if (j.payment_status === 'not_free') {
+          // intentionally not pushed
         } else {
-          if (sec) successLines.push(base);
+          const base = `${j.email}|${pw}|${sec}`;
+          if (state.successTab === 'with-session') {
+            if (j.session_data) {
+              successLines.push(`${base}|${JSON.stringify(j.session_data)}`);
+            }
+            // jobs without session_data are omitted until fetched
+          } else {
+            if (sec) successLines.push(base);
+          }
         }
       } else if (j.status === 'error') {
         if (pw) {
@@ -767,7 +795,10 @@
             dom.postRegLinkToggle.checked = data.post_reg_get_link;
           }
           if ('proxy' in data) {
-            applyProxyStateFromServer(data.proxy);
+            applyProxyStateFromServer(data.proxy, data.proxy_enabled);
+          }
+          if ('proxy_rotate' in data) {
+            applyProxyRotateState(data.proxy_rotate);
           }
           applySnapshot(data.jobs);
         } else if (data.type === 'job') {
@@ -988,16 +1019,104 @@
     dom.proxyStatusDetail.textContent = detail || '';
   }
 
-  function applyProxyStateFromServer(url) {
+  function applyProxyStateFromServer(url, enabled) {
     state.proxy = url || null;
-    // Sync input nếu user chưa edit thủ công
     if (!state.proxyEditing) {
       dom.proxyInput.value = url || '';
     }
-    if (url) {
+    if (enabled !== undefined && dom.proxyEnabledToggle) {
+      dom.proxyEnabledToggle.checked = !!enabled;
+    }
+    const active = url && (enabled !== false);
+    if (active) {
       setProxyStatus('idle', 'proxy set', maskProxyForDisplay(url));
+    } else if (url && enabled === false) {
+      setProxyStatus('direct', 'disabled', maskProxyForDisplay(url) + ' (off)');
     } else {
       setProxyStatus('direct', 'direct', 'no proxy configured');
+    }
+  }
+
+  function fmtRotateTime(ts) {
+    if (!ts) return '';
+    try {
+      return new Date(ts * 1000).toLocaleTimeString();
+    } catch {
+      return '';
+    }
+  }
+
+  function setProxyRotateStatus(kind, label, detail) {
+    const map = {
+      idle:    'proxy-status proxy-status-idle',
+      testing: 'proxy-status proxy-status-testing',
+      ok:      'proxy-status proxy-status-ok',
+      fail:    'proxy-status proxy-status-fail',
+      direct:  'proxy-status proxy-status-direct',
+    };
+    dom.proxyRotateStatus.className = map[kind] || map.idle;
+    dom.proxyRotateStatusLabel.textContent = label;
+    dom.proxyRotateDetail.textContent = detail || '';
+  }
+
+  function applyProxyRotateState(cfg) {
+    cfg = cfg || {};
+    if (!state.proxyRotateEditing) {
+      dom.proxyRotateToggle.checked = !!cfg.enabled;
+      dom.proxyRotateCommand.value = cfg.command || '';
+      dom.proxyRotateInterval.value = cfg.interval_seconds || 300;
+    }
+    const last = fmtRotateTime(cfg.last_run_at);
+    const detail = [last ? `last ${last}` : '', cfg.last_message || ''].filter(Boolean).join(' · ');
+    if (cfg.enabled) {
+      setProxyRotateStatus(cfg.last_ok ? 'ok' : 'idle', 'auto on', detail || 'waiting');
+    } else {
+      setProxyRotateStatus('direct', 'auto off', detail || 'manual proxy');
+    }
+  }
+
+  async function loadProxyRotateConfig() {
+    try {
+      const cfg = await api('/api/proxy/rotate/config');
+      if (cfg.proxy !== undefined) applyProxyStateFromServer(cfg.proxy);
+      applyProxyRotateState(cfg);
+    } catch (err) {
+      setProxyRotateStatus('fail', 'load fail', err.message);
+    }
+  }
+
+  async function saveProxyRotateConfig() {
+    dom.btnProxyRotateSave.disabled = true;
+    try {
+      const cfg = await api('/api/proxy/rotate/config', {
+        method: 'POST',
+        body: JSON.stringify({
+          enabled: dom.proxyRotateToggle.checked,
+          command: dom.proxyRotateCommand.value.trim(),
+          interval_seconds: parseInt(dom.proxyRotateInterval.value, 10) || 300,
+        }),
+      });
+      state.proxyRotateEditing = false;
+      if (cfg.proxy !== undefined) applyProxyStateFromServer(cfg.proxy);
+      applyProxyRotateState(cfg);
+    } catch (err) {
+      setProxyRotateStatus('fail', 'save fail', err.message);
+    } finally {
+      dom.btnProxyRotateSave.disabled = false;
+    }
+  }
+
+  async function rotateProxyNow() {
+    dom.btnProxyRotateNow.disabled = true;
+    setProxyRotateStatus('testing', 'rotating…', 'calling rotate URL/curl');
+    try {
+      const cfg = await api('/api/proxy/rotate-now', { method: 'POST' });
+      if (cfg.proxy !== undefined) applyProxyStateFromServer(cfg.proxy);
+      applyProxyRotateState(cfg);
+    } catch (err) {
+      setProxyRotateStatus('fail', 'rotate fail', err.message);
+    } finally {
+      dom.btnProxyRotateNow.disabled = false;
     }
   }
 
@@ -1054,8 +1173,34 @@
     }
   }
 
+  dom.proxyEnabledToggle.addEventListener('change', async () => {
+    const enabled = dom.proxyEnabledToggle.checked;
+    try {
+      const r = await api('/api/jobs/config', {
+        method: 'PATCH',
+        body: JSON.stringify({ proxy_enabled: enabled }),
+      });
+      applyProxyStateFromServer(r.proxy, r.proxy_enabled);
+    } catch (err) {
+      // Revert toggle on failure
+      dom.proxyEnabledToggle.checked = !enabled;
+      console.error('proxy toggle failed:', err);
+    }
+  });
   dom.btnProxyTest.addEventListener('click', () => testProxy({ silent: false }));
   dom.btnProxySave.addEventListener('click', () => saveProxy());
+  dom.btnProxyRotateNow.addEventListener('click', () => rotateProxyNow());
+  dom.btnProxyRotateSave.addEventListener('click', () => saveProxyRotateConfig());
+  [dom.proxyRotateToggle, dom.proxyRotateCommand, dom.proxyRotateInterval].forEach((el) => {
+    el.addEventListener('input', () => { state.proxyRotateEditing = true; });
+    el.addEventListener('change', () => { state.proxyRotateEditing = true; });
+  });
+  dom.proxyRotateCommand.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      saveProxyRotateConfig();
+    }
+  });
   $('btn-smsbower-refresh').addEventListener('click', () => refreshSmsBowerBalance());
   dom.proxyInput.addEventListener('input', () => {
     state.proxyEditing = true;
@@ -1115,7 +1260,10 @@
   setProxyStatus(_savedProxy ? 'idle' : 'direct', _savedProxy ? 'proxy set' : 'direct',
                  _savedProxy ? maskProxyForDisplay(_savedProxy) : 'no proxy configured');
 
-  // Sync server config on load — đẩy proxy localStorage lên server lần đầu
+  // Sync server config on load. Server giờ persist proxy ra disk (single
+  // source of truth) → KHÔNG gửi proxy rỗng để tránh xoá proxy đã lưu.
+  // Chỉ đẩy localStorage lên khi nó có giá trị (migrate giá trị cũ); rỗng
+  // → gửi null = "đừng đổi", rồi sync localStorage từ giá trị server trả về.
   api('/api/config', {
     method: 'POST',
     body: JSON.stringify({
@@ -1123,18 +1271,27 @@
       headless: state.headless,
       debug: state.debug,
       job_timeout: parseInt(dom.jobTimeout.value, 10) || 240,
-      proxy: _savedProxy,
+      proxy: _savedProxy || null,
       post_reg_get_session: dom.postRegSessionToggle.checked,
       post_reg_get_link: dom.postRegLinkToggle.checked,
     }),
   }).then((r) => {
-    applyProxyStateFromServer(r.proxy);
+    if (r.proxy) localStorage.setItem(LS_PROXY, r.proxy);
+    else localStorage.removeItem(LS_PROXY);
+    applyProxyStateFromServer(r.proxy, r.proxy_enabled);
+    if (r.proxy_rotate) applyProxyRotateState(r.proxy_rotate);
   }).catch(console.error);
 
   initTabs();
   updateComboCount();
   bootstrapMailModes();
   connectSSE();
+  loadProxyRotateConfig();
+  setInterval(() => {
+    if (dom.proxyRotateToggle.checked && !state.proxyRotateEditing) {
+      loadProxyRotateConfig();
+    }
+  }, 10000);
 
   // Timer cập nhật duration cho jobs đang running mỗi giây
   setInterval(() => {

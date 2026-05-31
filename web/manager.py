@@ -18,6 +18,7 @@ from ..mfa_phase import MfaError, enable_2fa
 from ..models import SignupRequest, SignupResult
 from ..signup import run_signup
 from .mail_modes import MailModeParseError, get_spec
+from .proxy_store import load_proxy, load_proxy_enabled, save_proxy, save_proxy_enabled
 
 
 # ── Load .env riêng của gpt_signup_hybrid ─────────────────────────────
@@ -50,6 +51,24 @@ def _env(key: str, default: str) -> str:
 _MAX_CONCURRENT = min(max(int(_env("HYBRID_MAX_CONCURRENT", "2")), 1), 10)
 _DEFAULT_JOB_TIMEOUT = min(max(float(_env("HYBRID_JOB_TIMEOUT", "240")), 30), 600)
 _DEFAULT_PROXY = _env("HYBRID_OUTLOOK_PROXY", "") or None
+
+
+def _normalize_proxy(value: str | None) -> str | None:
+    """None/'' → None, ngược lại strip whitespace."""
+    if value is None:
+        return None
+    return str(value).strip() or None
+
+
+def _set_and_persist_proxy(value: str | None) -> str | None:
+    """Normalize + persist proxy ra disk, trả giá trị đã normalize.
+
+    Dùng chung cho cả 3 manager (Job/Session/Link) — DRY + đảm bảo proxy
+    survive server restart bất kể endpoint nào đổi nó.
+    """
+    normalized = _normalize_proxy(value)
+    save_proxy(normalized)
+    return normalized
 
 
 def _mask_proxy(proxy: str | None) -> str:
@@ -86,6 +105,11 @@ class Job:
     # Post-reg optional results
     session_data: dict[str, Any] | None = None  # post-reg session JSON
     payment_link: str | None = None  # post-reg payment URL
+    # Post-reg payment check (auto-runs after success)
+    payment_status: str | None = None  # "free" | "not_free" | "check_failed"
+    payment_amount: int | None = None  # cents
+    payment_currency: str | None = None
+    payment_trial_days: int | None = None
     created_at: float = field(default_factory=time.time)
     started_at: float | None = None
     finished_at: float | None = None
@@ -106,6 +130,10 @@ class Job:
             "session_data": self.session_data,
             "session_access_token": (self.session_data or {}).get("accessToken") if self.session_data else None,
             "payment_link": self.payment_link,
+            "payment_status": self.payment_status,
+            "payment_amount": self.payment_amount,
+            "payment_currency": self.payment_currency,
+            "payment_trial_days": self.payment_trial_days,
             "created_at": self.created_at,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
@@ -210,7 +238,8 @@ class JobManager:
         self._headless = True
         self._debug = False
         self._job_timeout = _DEFAULT_JOB_TIMEOUT
-        self._proxy: str | None = _DEFAULT_PROXY
+        self._proxy: str | None = load_proxy(default=_DEFAULT_PROXY)
+        self._proxy_enabled: bool = load_proxy_enabled()
         self._tasks: dict[str, asyncio.Task] = {}  # job_id → running task (for cancel)
         self._subscribers: set[asyncio.Queue] = set()
         # Worker pool
@@ -341,13 +370,24 @@ class JobManager:
     def proxy(self) -> str | None:
         return self._proxy
 
+    @property
+    def proxy_enabled(self) -> bool:
+        return self._proxy_enabled
+
+    @property
+    def effective_proxy(self) -> str | None:
+        return self._proxy if self._proxy_enabled else None
+
     def set_proxy(self, value: str | None) -> None:
-        """Set proxy chung cho tất cả jobs sau này. None/'' = direct."""
-        if value is None:
-            self._proxy = None
-            return
-        v = str(value).strip()
-        self._proxy = v or None
+        """Set proxy chung cho tất cả jobs sau này. None/'' = direct.
+
+        Persist ra disk để survive server restart.
+        """
+        self._proxy = _set_and_persist_proxy(value)
+
+    def set_proxy_enabled(self, value: bool) -> None:
+        self._proxy_enabled = bool(value)
+        save_proxy_enabled(self._proxy_enabled)
 
     @property
     def post_reg_get_session(self) -> bool:
@@ -587,7 +627,7 @@ class JobManager:
             self._job_log(job, "[fetch-session] calling /api/auth/session...")
             session_data = await fetch_session_via_http(
                 cookies=cookies,
-                proxy=self._proxy,
+                proxy=self.effective_proxy,
                 timeout=30.0,
             )
             job.session_data = session_data
@@ -703,7 +743,7 @@ class JobManager:
                 mfa_result = await enable_2fa(
                     access_token=access_token,
                     cookies=sdata.get("cookies"),
-                    proxy=self._proxy,
+                    proxy=self.effective_proxy,
                     log=log,
                 )
             except MfaError as exc:
@@ -753,7 +793,7 @@ class JobManager:
                 self._job_log(job, msg)
 
             log(f"[mode] {job.mail_mode}")
-            if self._proxy:
+            if self.effective_proxy:
                 log(f"[proxy] using {self._safe_proxy_log()}")
 
             # Build SignupRequest qua registry spec
@@ -765,7 +805,7 @@ class JobManager:
                 password=job.password or getattr(job, '_default_password', None),
                 headless=self._headless,
                 keep_browser_open=self._debug and not self._headless,
-                proxy=self._proxy,
+                proxy=self.effective_proxy,
             )
             # Extra fields (e.g. smsbower_max_all_codes cho recheck jobs)
             extra = getattr(job, '_extra_req_fields', None)
@@ -821,7 +861,7 @@ class JobManager:
                 mfa_result = await enable_2fa(
                     access_token=result.access_token,
                     cookies=result.cookies,
-                    proxy=self._proxy,
+                    proxy=self.effective_proxy,
                     log=log,
                 )
             except MfaError as exc:
@@ -848,6 +888,9 @@ class JobManager:
             # Post-reg optional steps
             if self._post_reg_get_session or self._post_reg_get_link:
                 await self._post_reg_steps(job, result)
+
+            # Always auto-check payment (free trial vs charged) using access_token
+            await self._post_reg_check_payment(job, result)
 
             job.status = "success"
             job.finished_at = time.time()
@@ -881,7 +924,7 @@ class JobManager:
                 from ..session_phase import fetch_session_via_http
                 data = await fetch_session_via_http(
                     cookies=cookies,
-                    proxy=self._proxy,
+                    proxy=self.effective_proxy,
                     timeout=30.0,
                 )
                 job.session_data = data
@@ -897,11 +940,44 @@ class JobManager:
                 if not access_token:
                     raise RuntimeError("access_token rỗng từ SignupResult")
                 from ..payment_link import get_checkout_url
-                url = await get_checkout_url(access_token, proxy=self._proxy)
+                url = await get_checkout_url(access_token, proxy=self.effective_proxy)
                 job.payment_link = url
                 self._job_log(job, f"[post-reg] payment link: {url}")
             except Exception as exc:
                 self._job_log(job, f"[post-reg] get-link failed: {exc}")
+
+    async def _post_reg_check_payment(self, job: Job, result: SignupResult) -> None:
+        """Check trial/payment status sau khi signup success.
+
+        Set job.payment_status = "free" | "not_free" | "check_failed".
+        Không fail job nếu check lỗi — chỉ mark "check_failed".
+        """
+        access_token = result.access_token
+        if not access_token:
+            job.payment_status = "check_failed"
+            self._job_log(job, "[payment-check] skip — access_token rỗng")
+            return
+        try:
+            from ..payment_link import get_checkout_info, PaymentLinkError
+            self._job_log(job, "[payment-check] verifying trial status...")
+            info = await get_checkout_info(access_token, proxy=self.effective_proxy, timeout=30.0)
+            job.payment_amount = info.amount_due
+            job.payment_currency = info.currency
+            job.payment_trial_days = info.trial_days
+            if info.is_trial:
+                job.payment_status = "free"
+                detail = f"trial_days={info.trial_days}" if info.trial_days else "amount=0"
+                self._job_log(job, f"[payment-check] ✅ FREE ({detail})")
+            else:
+                job.payment_status = "not_free"
+                amount = f"{info.amount_due / 100:.2f} {info.currency}" if info.amount_due > 0 else "unknown"
+                self._job_log(job, f"[payment-check] 💳 NOT FREE — {amount}")
+        except PaymentLinkError as exc:
+            job.payment_status = "check_failed"
+            self._job_log(job, f"[payment-check] failed: {exc}")
+        except Exception as exc:
+            job.payment_status = "check_failed"
+            self._job_log(job, f"[payment-check] error: {type(exc).__name__}: {exc}")
 
 
 # Singleton
@@ -970,7 +1046,8 @@ class SessionJobManager:
         self._max = max_concurrent
         self._headless = True
         self._job_timeout = _DEFAULT_JOB_TIMEOUT
-        self._proxy: str | None = _DEFAULT_PROXY
+        self._proxy: str | None = load_proxy(default=_DEFAULT_PROXY)
+        self._proxy_enabled: bool = load_proxy_enabled()
         self._tasks: dict[str, asyncio.Task] = {}
         self._subscribers: set[asyncio.Queue] = set()
         self._job_queue: asyncio.Queue[str] = asyncio.Queue()
@@ -1078,15 +1155,24 @@ class SessionJobManager:
     def proxy(self) -> str | None:
         return self._proxy
 
+    @property
+    def proxy_enabled(self) -> bool:
+        return self._proxy_enabled
+
+    @property
+    def effective_proxy(self) -> str | None:
+        return self._proxy if self._proxy_enabled else None
+
     def set_proxy(self, value: str | None) -> None:
-        if value is None:
-            self._proxy = None
-            return
-        v = str(value).strip()
-        self._proxy = v or None
+        # Persist ra disk để survive server restart.
+        self._proxy = _set_and_persist_proxy(value)
+
+    def set_proxy_enabled(self, value: bool) -> None:
+        self._proxy_enabled = bool(value)
+        save_proxy_enabled(self._proxy_enabled)
 
     def _safe_proxy_log(self) -> str:
-        return _mask_proxy(self._proxy)
+        return _mask_proxy(self.effective_proxy)
 
     def subscribe(self) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue(maxsize=500)
@@ -1259,7 +1345,7 @@ class SessionJobManager:
             def log(msg: str) -> None:
                 self._job_log(job, msg)
 
-            if self._proxy:
+            if self.effective_proxy:
                 log(f"[proxy] using {self._safe_proxy_log()}")
 
             from ..config import env_insecure_tls
@@ -1269,7 +1355,7 @@ class SessionJobManager:
                     password=job.password,
                     secret=job.secret,
                     headless=self._headless,
-                    proxy=self._proxy,
+                    proxy=self.effective_proxy,
                     tls_insecure=env_insecure_tls(),
                     log=log,
                 ),
@@ -1396,7 +1482,8 @@ class LinkJobManager:
         self._max = max_concurrent
         self._headless = True
         self._job_timeout = 180.0
-        self._proxy: str | None = _DEFAULT_PROXY
+        self._proxy: str | None = load_proxy(default=_DEFAULT_PROXY)
+        self._proxy_enabled: bool = load_proxy_enabled()
         self._region: str = DEFAULT_REGION
         self._tasks: dict[str, asyncio.Task] = {}
         self._subscribers: set[asyncio.Queue] = set()
@@ -1505,12 +1592,21 @@ class LinkJobManager:
     def proxy(self) -> str | None:
         return self._proxy
 
+    @property
+    def proxy_enabled(self) -> bool:
+        return self._proxy_enabled
+
+    @property
+    def effective_proxy(self) -> str | None:
+        return self._proxy if self._proxy_enabled else None
+
     def set_proxy(self, value: str | None) -> None:
-        if value is None:
-            self._proxy = None
-            return
-        v = str(value).strip()
-        self._proxy = v or None
+        # Persist ra disk để survive server restart.
+        self._proxy = _set_and_persist_proxy(value)
+
+    def set_proxy_enabled(self, value: bool) -> None:
+        self._proxy_enabled = bool(value)
+        save_proxy_enabled(self._proxy_enabled)
 
     @property
     def region(self) -> str:
@@ -1522,7 +1618,7 @@ class LinkJobManager:
         self._region = value
 
     def _safe_proxy_log(self) -> str:
-        return _mask_proxy(self._proxy)
+        return _mask_proxy(self.effective_proxy)
 
     def subscribe(self) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue(maxsize=500)
@@ -1636,6 +1732,7 @@ class LinkJobManager:
             blob = blob.strip()
             if not blob:
                 continue
+            email_hint, blob = self._extract_session_blob_from_line(blob)
 
             try:
                 data = json.loads(blob)
@@ -1669,7 +1766,7 @@ class LinkJobManager:
 
             token = data.get("accessToken") or data.get("access_token") or ""
             user = data.get("user") or {}
-            email = user.get("email") or f"token_{uuid.uuid4().hex[:6]}"
+            email = user.get("email") or data.get("email") or email_hint or f"token_{uuid.uuid4().hex[:6]}"
             user_id = user.get("id") or data.get("userId") or data.get("user_id")
 
             if not token:
@@ -1706,12 +1803,12 @@ class LinkJobManager:
         """Mode access_token: mỗi line là 1 raw JWT."""
         out: list[LinkJob] = []
         for raw in lines:
-            token = raw.strip()
+            email_hint, token = self._extract_token_from_line(raw)
             if not token or token.startswith("#"):
                 continue
 
             # Tạo label từ token (email nếu decode được, hoặc token prefix)
-            email = self._extract_email_from_jwt(token) or f"token_...{token[-8:]}"
+            email = self._extract_email_from_jwt(token) or email_hint or f"token_...{token[-8:]}"
 
             if email.lower() in existing_emails:
                 continue
@@ -1727,6 +1824,42 @@ class LinkJobManager:
             self._broadcast_job(job)
             out.append(job)
         return out
+
+    @staticmethod
+    def _extract_session_blob_from_line(line: str) -> tuple[str, str]:
+        """Accept raw session JSON or exported email|pass|2fa|session line."""
+        value = (line or "").strip()
+        email_hint = ""
+        if not value:
+            return email_hint, value
+        if value.startswith("{"):
+            return email_hint, value
+        if "|" in value:
+            parts = [p.strip() for p in value.split("|")]
+            email_hint = parts[0] if parts else ""
+            if len(parts) >= 4:
+                return email_hint, "|".join(parts[3:]).strip()
+        pos = value.find("{")
+        if pos >= 0:
+            return email_hint, value[pos:].strip()
+        return email_hint, value
+
+    @classmethod
+    def _extract_token_from_line(cls, line: str) -> tuple[str, str]:
+        """Accept raw JWT, session JSON, or exported email|pass|2fa|session line."""
+        email_hint, value = cls._extract_session_blob_from_line(line)
+        if not value:
+            return email_hint, ""
+        if value.startswith("{"):
+            try:
+                data = json.loads(value)
+                token = data.get("accessToken") or data.get("access_token") or data.get("token") or ""
+                user = data.get("user") or {}
+                email_hint = user.get("email") or data.get("email") or email_hint
+                return email_hint, str(token or "").strip()
+            except (json.JSONDecodeError, ValueError, TypeError):
+                return email_hint, ""
+        return email_hint, value.strip()
 
     @staticmethod
     def _extract_email_from_jwt(token: str) -> str | None:
@@ -1865,7 +1998,7 @@ class LinkJobManager:
             if job.mode == "combo":
                 # Login via browser → obtain token
                 log("[login] starting")
-                if self._proxy:
+                if self.effective_proxy:
                     log(f"[login] via proxy {self._safe_proxy_log()}")
                 from ..config import env_insecure_tls
                 try:
@@ -1875,7 +2008,7 @@ class LinkJobManager:
                             password=job.password,
                             secret=job.secret,
                             headless=self._headless,
-                            proxy=self._proxy,
+                            proxy=self.effective_proxy,
                             tls_insecure=env_insecure_tls(),
                             log=log,
                         ),
@@ -1920,11 +2053,11 @@ class LinkJobManager:
 
             # ── Get payment link + trial info ──
             log(f"[link] fetching payment URL (region={job.region})")
-            if self._proxy:
+            if self.effective_proxy:
                 log(f"[link] via proxy {self._safe_proxy_log()}")
             try:
                 info = await asyncio.wait_for(
-                    get_checkout_info(access_token, region=job.region, proxy=self._proxy),
+                    get_checkout_info(access_token, region=job.region, proxy=self.effective_proxy),
                     timeout=60.0,
                 )
                 url = info.payment_url

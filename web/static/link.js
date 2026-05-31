@@ -172,9 +172,6 @@
 
       const actions = [];
       if (job.payment_link) {
-        actions.push(
-          `<button class="icon-btn" data-action="copy-link" data-id="${escHtml(id)}" title="Copy payment link">${window.GptUi.icon('link')}</button>`,
-        );
         // Always show open/UPI buttons — trial badge is informational only
         {
           actions.push(
@@ -193,29 +190,34 @@
               `<button class="icon-btn upi-btn" data-action="upi-fill" data-id="${escHtml(id)}" title="${upiTitle}" ${upiAttrs}>${upiLabel}</button>`,
             );
           }
-          // UPI polling controls (only after upiDone and not yet paid)
-          if (state.upiDone.has(id) && !upiPaid) {
+          // Watch / Copy+Watch controls — available as soon as checkout_session_id exists
+          if (job.checkout_session_id && !upiPaid) {
             if (isPolling) {
               actions.push(
                 `<button class="icon-btn" data-action="upi-stop-poll" data-id="${escHtml(id)}" title="Stop watching payment" style="color:var(--red)">⏹</button>`,
               );
             } else {
-              actions.push(
-                `<button class="icon-btn" data-action="upi-start-poll" data-id="${escHtml(id)}" title="Watch for payment">👁</button>`,
-              );
+              const hasShot = job.screenshot_urls && job.screenshot_urls.length > 0;
+              if (hasShot) {
+                // Copy latest screenshot AND start watching
+                const latestShot = job.screenshot_urls[job.screenshot_urls.length - 1];
+                actions.push(
+                  `<button class="icon-btn" data-action="copy-watch" data-id="${escHtml(id)}" data-url="${escHtml(latestShot)}" title="Copy ảnh + Watch payment">📋👁</button>`,
+                );
+              } else {
+                // No screenshot yet — just watch
+                actions.push(
+                  `<button class="icon-btn" data-action="upi-start-poll" data-id="${escHtml(id)}" title="Watch for payment">👁</button>`,
+                );
+              }
             }
           }
         }
       }
-      if (job.status === 'success') {
-        const pr = state.plusResults.get(id);
-        const plLabel = !pr ? '✦ Plus?' : pr.checking ? '⏳' : pr.is_plus ? `✅ ${escHtml(pr.plan||'Plus')}` : '❌ No Plus';
-        actions.push(`<button class="icon-btn" data-action="check-plus" data-id="${escHtml(id)}" title="Check ChatGPT Plus" ${pr?.checking?'disabled':''}>${plLabel}</button>`);
-        if (job.checkout_session_id) {
-          const py = state.payResults.get(id);
-          const pyLabel = !py ? '💳?' : py.checking ? '⏳' : py.paid ? '✅ Paid' : '❌ Unpaid';
-          actions.push(`<button class="icon-btn" data-action="check-payment" data-id="${escHtml(id)}" title="Check payment status" ${py?.checking?'disabled':''}>${pyLabel}</button>`);
-        }
+      if (job.status === 'success' && job.checkout_session_id) {
+        const py = state.payResults.get(id);
+        const pyLabel = !py ? '💳?' : py.checking ? '⏳' : py.paid ? '✅ Paid' : '❌ Unpaid';
+        actions.push(`<button class="icon-btn" data-action="check-payment" data-id="${escHtml(id)}" title="Check payment status" ${py?.checking?'disabled':''}>${pyLabel}</button>`);
       }
       if (job.status === 'running') {
         actions.push(
@@ -255,9 +257,13 @@
         : '';
 
       const shots = (job.screenshot_urls && job.screenshot_urls.length)
-        ? `<div class="job-meta">📸 ${job.screenshot_urls.map((u, i) =>
-            `<a href="${escHtml(u)}" data-action="show-shot" data-url="${escHtml(u)}" class="shot-link" title="Xem ảnh">shot${job.screenshot_urls.length > 1 ? (i + 1) : ''}</a><button class="shot-copy-btn" data-action="copy-shot" data-url="${escHtml(u)}" title="Copy ảnh vào clipboard">📋</button>`
-          ).join(' · ')}</div>`
+        ? `<div class="job-shots">${job.screenshot_urls.map((u, i) => {
+            const label = job.screenshot_urls.length > 1 ? `shot ${i + 1}` : 'shot';
+            return `<span class="shot-chip">
+              <a href="${escHtml(u)}" data-action="show-shot" data-url="${escHtml(u)}" class="shot-chip-label" title="Xem ảnh">📸 ${label}</a>
+              <button class="shot-chip-btn" data-action="copy-shot" data-url="${escHtml(u)}" title="Copy ảnh vào clipboard">📋</button>
+            </span>`;
+          }).join('')}</div>`
         : '';
 
       const modeTag = job.mode && job.mode !== 'combo' ? `<span class="muted">[${escHtml(job.mode)}]</span> ` : '';
@@ -369,6 +375,7 @@
         ${!isDone ? `
         <button class="btn btn-ghost btn-small" data-watch-action="done" data-slot="${s.slot_idx}">✅ Done</button>
         <button class="btn btn-ghost btn-small" data-watch-action="fail" data-slot="${s.slot_idx}">❌ Fail</button>
+        <button class="btn btn-ghost btn-small" data-watch-action="reload" data-slot="${s.slot_idx}">🔄 Reload</button>
         <button class="btn btn-ghost btn-small" data-watch-action="off"  data-slot="${s.slot_idx}">🔴 Off</button>
         ` : ''}
       </div>`;
@@ -632,7 +639,8 @@
     if (!btn) return;
     const action = btn.dataset.watchAction;
     const slotIdx = parseInt(btn.dataset.slot, 10);
-    btn.disabled = true;
+    // Reload keeps the slot alive — don't disable the button.
+    if (action !== 'reload') btn.disabled = true;
     try {
       await api(`/api/link/watch/slot/${slotIdx}/action`, {
         method: 'POST',
@@ -646,6 +654,43 @@
   });
 
   // ─── UPI payment polling ───
+  // Robust image copy: Camoufox windows opening during UPI gen can steal focus
+  // between fetch and clipboard.write, causing "Document is not focused" errors.
+  // Strategy: fetch first, then retry the write a few times while forcing focus;
+  // on persistent failure, open the image in a new tab as a fallback.
+  async function copyShotRobust(url, btn) {
+    const orig = btn.textContent;
+    btn.textContent = '⏳';
+    let blob;
+    try {
+      blob = await (await fetch(url, { cache: 'no-store' })).blob();
+    } catch (err) {
+      btn.textContent = orig;
+      alert('Không tải được ảnh: ' + err.message);
+      return;
+    }
+    const item = new ClipboardItem({ [blob.type || 'image/png']: blob });
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      try {
+        window.focus();
+        await navigator.clipboard.write([item]);
+        btn.textContent = '✅';
+        setTimeout(() => { btn.textContent = orig; }, 1500);
+        return;
+      } catch (err) {
+        if (attempt < 5) {
+          // Wait a tick and retry — focus may have been stolen by Camoufox.
+          await new Promise(r => setTimeout(r, 150));
+          continue;
+        }
+        // All retries failed — open the image so user can right-click to copy.
+        btn.textContent = orig;
+        try { window.open(url, '_blank', 'noopener'); } catch {}
+        alert('Không copy trực tiếp được (browser khác đang giữ focus).\nĐã mở ảnh trong tab mới — chuột phải → Copy image.\n\nLỗi: ' + err.message);
+      }
+    }
+  }
+
   function startUpiPolling(jobId) {
     if (state.upiPolling.has(jobId)) return;
     const job = state.jobs.get(jobId);
@@ -653,24 +698,25 @@
       alert('Không có Stripe session ID để poll. Hãy thử lại lấy link.');
       return;
     }
-    const intervalId = setInterval(async () => {
+    // Reuse the same endpoint as the "Check Payment" button — it detects the
+    // `checkout_not_active_session` error code (session closed after payment),
+    // which `/api/stripe/poll-paid` does NOT handle (would loop forever).
+    const tick = async () => {
       try {
-        const data = await api('/api/stripe/poll-paid', {
-          method: 'POST',
-          body: JSON.stringify({
-            session_id: job.checkout_session_id,
-            publishable_key: job.publishable_key,
-          }),
-        });
+        const data = await api(`/api/link/jobs/${jobId}/check-payment`, { method: 'POST' });
         if (data.paid) {
           stopUpiPolling(jobId);
           state.upiPaid.add(jobId);
+          state.payResults.set(jobId, { ...data, checking: false });
           renderJobs();
         }
       } catch (err) {
-        console.error('[upi-poll] error:', err.message);
+        console.error('[watch-payment] error:', err.message);
       }
-    }, 5000);
+    };
+    // Kick off immediately so user sees a result fast, then poll every 5s.
+    tick();
+    const intervalId = setInterval(tick, 5000);
     state.upiPolling.set(jobId, intervalId);
     renderJobs();
   }
@@ -737,18 +783,7 @@
         event.preventDefault();
         const url = actionBtn.dataset.url;
         if (!url) return;
-        fetch(url)
-          .then((r) => r.blob())
-          .then((blob) => {
-            const item = new ClipboardItem({ [blob.type || 'image/png']: blob });
-            return navigator.clipboard.write([item]);
-          })
-          .then(() => {
-            const orig = actionBtn.textContent;
-            actionBtn.textContent = '✅';
-            setTimeout(() => { actionBtn.textContent = orig; }, 1500);
-          })
-          .catch((err) => alert('Không copy được ảnh: ' + err.message));
+        copyShotRobust(url, actionBtn);
       } else if (action === 'upi-fill') {
         if (state.upiInProgress.has(id)) return;
         state.upiInProgress.add(id);
@@ -765,13 +800,11 @@
             state.upiInProgress.delete(id);
             renderJobs();
           });
-      } else if (action === 'check-plus') {
-        state.plusResults.set(id, { checking: true });
-        renderJobs();
-        api(`/api/link/jobs/${id}/check-plus`, { method: 'POST' })
-          .then((res) => state.plusResults.set(id, { ...res, checking: false }))
-          .catch((err) => state.plusResults.set(id, { checking: false, is_plus: false, error: err.message }))
-          .finally(() => renderJobs());
+      } else if (action === 'copy-watch') {
+        const url = actionBtn.dataset.url;
+        // Fire both in parallel: copy the screenshot, and kick off payment watch.
+        if (url) copyShotRobust(url, actionBtn);
+        startUpiPolling(id);
       } else if (action === 'check-payment') {
         state.payResults.set(id, { checking: true });
         renderJobs();

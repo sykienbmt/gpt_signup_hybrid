@@ -1058,12 +1058,14 @@ async def run_browser_phase(
     logging_id = str(uuid.uuid4())
     log(f"[browser] device_id={device_id} logging_id={logging_id}")
 
+    from .config import browser_proxy_config
+
     w, h = settings.browser_viewport_width, settings.browser_viewport_height
     viewport = {"width": w, "height": h}
 
     proxy_kwargs: dict[str, Any] = {}
     if request.proxy:
-        proxy_kwargs["proxy"] = {"server": request.proxy}
+        proxy_kwargs["proxy"] = browser_proxy_config(request.proxy)
 
     state_param: str | None = None
     handoff_cookies: list[dict[str, Any]] = []

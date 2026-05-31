@@ -8,6 +8,7 @@ import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import unquote, urlsplit
 
 
 # ─── Env parsing helpers ──────────────────────────────────────────────
@@ -70,6 +71,7 @@ class Settings:
     browser_use_profile_template: bool = True
     browser_profile_template_dir: Path = Path("runtime/profiles/template")
     browser_camoufox_profile_dir: Path = Path("runtime/profiles/camoufox_template")
+    change_password_browser_engine: str = ""
 
     @property
     def profiles_dir(self) -> Path:
@@ -111,6 +113,7 @@ def load_settings(root_dir: Path | None = None, env_file: str | Path = ".env") -
         ),
         browser_profile_template_dir=profile_template_dir,
         browser_camoufox_profile_dir=camoufox_profile_dir,
+        change_password_browser_engine=_lookup(env, "CHANGE_PASSWORD_BROWSER_ENGINE", ""),
     )
 
 
@@ -203,3 +206,32 @@ def warn_insecure_tls(scope: str) -> None:
     )
     print(msg, file=sys.stderr)
     warnings.warn(msg, RuntimeWarning, stacklevel=2)
+
+
+def browser_proxy_config(proxy: str | None) -> dict[str, str] | None:
+    """Convert proxy URL into Playwright/Camoufox proxy config.
+
+    Browser drivers expect credentials split out from `server`; passing
+    `http://user:pass@host:port` directly can fail in Firefox/Camoufox with
+    proxy connection errors even when httpx can use the same URL.
+    """
+    value = (proxy or "").strip()
+    if not value:
+        return None
+    parsed = urlsplit(value)
+    if not parsed.scheme or not parsed.hostname:
+        return {"server": value}
+
+    host = parsed.hostname
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    server = f"{parsed.scheme}://{host}"
+    if parsed.port:
+        server = f"{server}:{parsed.port}"
+
+    out = {"server": server}
+    if parsed.username:
+        out["username"] = unquote(parsed.username)
+    if parsed.password:
+        out["password"] = unquote(parsed.password)
+    return out

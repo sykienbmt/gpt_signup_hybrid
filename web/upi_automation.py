@@ -367,7 +367,15 @@ async def run_upi_automation(
 
     proxy_kwargs: dict = {}
     if proxy:
-        proxy_kwargs["proxy"] = {"server": proxy}
+        from urllib.parse import urlparse
+        parsed = urlparse(proxy)
+        server = f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
+        proxy_cfg: dict = {"server": server}
+        if parsed.username:
+            proxy_cfg["username"] = parsed.username
+        if parsed.password:
+            proxy_cfg["password"] = parsed.password
+        proxy_kwargs["proxy"] = proxy_cfg
 
     win_w, win_h = 1100, 800
     cf = AsyncCamoufox(

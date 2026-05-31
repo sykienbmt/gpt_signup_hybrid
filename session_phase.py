@@ -24,8 +24,8 @@ from ._browser_retry import (
     LAUNCH_RETRY_MAX as _LAUNCH_RETRY_MAX,
     is_driver_dead_error as _is_driver_dead_error,
 )
-from ._nextauth_bootstrap import bootstrap_authorize_url
-from .config import ensure_runtime_dirs, load_settings, prepare_profile_dir
+from ._nextauth_bootstrap import bootstrap_authorize_url_http
+from .config import browser_proxy_config, ensure_runtime_dirs, load_settings, prepare_profile_dir
 from .totp_helper import generate_code
 
 
@@ -44,6 +44,40 @@ async () => {
     return await r.json();
 }
 """
+
+_PROXY_CHECK_URL = "https://chatgpt.com/"
+_PROXY_CHECK_TIMEOUT = 10
+
+
+async def _check_proxy(proxy: str, log: LogFn) -> None:
+    """Quick connectivity check through proxy before launching browser.
+
+    Uses curl_cffi so it respects the same TLS fingerprint stack as http_phase.
+    Raises SessionError immediately if the proxy is unreachable.
+    """
+    import time
+    from curl_cffi.requests import AsyncSession
+
+    log("[session] checking proxy connectivity...")
+    t0 = time.monotonic()
+    try:
+        async with AsyncSession() as s:
+            resp = await s.get(
+                _PROXY_CHECK_URL,
+                proxies={"https": proxy, "http": proxy},
+                timeout=_PROXY_CHECK_TIMEOUT,
+                impersonate="firefox135",
+            )
+        elapsed = time.monotonic() - t0
+        if resp.status_code >= 500:
+            raise SessionError(
+                f"proxy check got HTTP {resp.status_code} from {_PROXY_CHECK_URL}"
+            )
+        log(f"[session] proxy ok ({resp.status_code}, {elapsed:.1f}s)")
+    except SessionError:
+        raise
+    except Exception as exc:
+        raise SessionError(f"proxy unreachable: {exc}") from exc
 
 
 async def _get_session_browser(
@@ -67,21 +101,17 @@ async def _get_session_browser(
         warn_insecure_tls("session_phase")
         log("[security] TLS verification DISABLED — debug mode")
 
+    if proxy:
+        await _check_proxy(proxy, log)
+
     settings = load_settings()
     job_id = f"session_{uuid.uuid4().hex[:10]}"
-    preferred_engine = (
-        "camoufox"
-        if (settings.browser_engine or "camoufox").lower() == "camoufox"
-        else "chromium"
-    )
-    engine_order = [preferred_engine]
-    if preferred_engine == "camoufox":
-        engine_order.append("chromium")
+    engine_order = ["camoufox"]
     w, h = settings.browser_viewport_width, settings.browser_viewport_height
     viewport = {"width": w, "height": h}
     proxy_kwargs: dict[str, Any] = {}
     if proxy:
-        proxy_kwargs["proxy"] = {"server": proxy}
+        proxy_kwargs["proxy"] = browser_proxy_config(proxy)
 
     progress = {"password_submitted": False}
 
@@ -100,20 +130,25 @@ async def _get_session_browser(
         device_id = str(uuid.uuid4())
         logging_id = str(uuid.uuid4())
 
-        # Step 1: bootstrap
-        log("[session] loading chatgpt.com...")
-        await page.goto("https://chatgpt.com/", wait_until="domcontentloaded")
-        log("[session] bootstrapping NextAuth...")
-        authorize_url = await bootstrap_authorize_url(
-            page,
+        # Step 1: get authorize URL + chatgpt.com cookies via HTTP
+        log("[session] bootstrapping NextAuth via HTTP...")
+        authorize_url, chatgpt_cookies = await bootstrap_authorize_url_http(
+            proxy=proxy,
             email=email,
             device_id=device_id,
             logging_id=logging_id,
         )
-        log("[session] authorize URL ready")
+        log("[session] authorize URL ready, navigating to login page...")
 
-        # Step 2: navigate authorize → login page
-        await page.goto(authorize_url, wait_until="domcontentloaded")
+        # Inject chatgpt.com cookies so the OAuth callback can validate state/CSRF
+        if chatgpt_cookies:
+            try:
+                await ctx.add_cookies(chatgpt_cookies)
+            except Exception:
+                pass
+
+        # Step 2: browser starts directly on auth.openai.com
+        await page.goto(authorize_url, wait_until="domcontentloaded", timeout=60_000)
         await asyncio.sleep(3.0)
         log(f"[session] at: {page.url.split('?')[0]}")
 
@@ -314,34 +349,8 @@ async def _get_session_browser(
             except Exception:
                 pass
 
-    async def _run_chromium_once(profile_dir: Any) -> dict[str, Any]:
-        from playwright.async_api import async_playwright
-
-        playwright = await async_playwright().start()
-        try:
-            channel = settings.browser_channel or None
-            ctx = await playwright.chromium.launch_persistent_context(
-                user_data_dir=str(profile_dir),
-                headless=headless,
-                channel=channel,
-                viewport=viewport,
-                ignore_https_errors=tls_insecure,
-                **proxy_kwargs,
-            )
-            try:
-                page = ctx.pages[0] if ctx.pages else await ctx.new_page()
-                return await _drive_session_flow(ctx, page)
-            finally:
-                try:
-                    await ctx.close()
-                except Exception:
-                    pass
-        finally:
-            await playwright.stop()
-
     runners = {
         "camoufox": _run_camoufox_once,
-        "chromium": _run_chromium_once,
     }
     last_exc: BaseException | None = None
     try:
@@ -391,13 +400,6 @@ async def _get_session_browser(
                         use_template=settings.browser_use_profile_template,
                     )
                     await asyncio.sleep(_LAUNCH_RETRY_BACKOFF)
-
-            if engine == "camoufox" and engine_index + 1 < len(engine_order):
-                log(
-                    "[session] camoufox chết sớm ở auth redirect — "
-                    "thử fallback sang chromium"
-                )
-                continue
 
             if last_exc is not None and _is_driver_dead_error(last_exc):
                 raise SessionError(

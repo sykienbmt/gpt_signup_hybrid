@@ -12,7 +12,7 @@ from __future__ import annotations
 
 
 # Số lần thử lại launch khi driver pipe đóng sớm.
-LAUNCH_RETRY_MAX = 2
+LAUNCH_RETRY_MAX = 4
 
 # Backoff giữa các retry (seconds).
 LAUNCH_RETRY_BACKOFF = 2.0

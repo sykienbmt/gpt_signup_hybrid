@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import random
+import time
 from pathlib import Path
 from typing import Any
 
@@ -13,8 +14,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .auth import get_token  # legacy — token auth disabled
-from .manager import get_manager, get_session_manager, get_link_manager
+from .manager import get_manager, get_session_manager, get_link_manager, _mask_proxy
 from .mail_modes import get_registry, serialize_for_api
+from .proxy_rotate import ProxyRotateService, load_proxy_rotate, save_proxy_rotate
 from .upi_automation import run_upi_automation
 from .upi_watch import UpiWatchManager
 from .check_account import check_accounts
@@ -34,6 +36,80 @@ def _asset_version() -> str:
 
 
 app = FastAPI(title="gpt_signup_hybrid web UI", version="0.1.0")
+
+
+def _apply_global_proxy(value: str | None) -> str | None:
+    manager = get_manager()
+    manager.set_proxy(value)
+    get_session_manager().set_proxy(value)
+    get_link_manager().set_proxy(value)
+    return manager.proxy
+
+
+def _apply_global_proxy_enabled(value: bool) -> bool:
+    get_manager().set_proxy_enabled(value)
+    get_session_manager().set_proxy_enabled(value)
+    get_link_manager().set_proxy_enabled(value)
+    return value
+
+
+_proxy_rotate_service = ProxyRotateService(_apply_global_proxy)
+_CHANGE_PASSWORD_LOG_TTL_SECONDS = 3600
+_CHANGE_PASSWORD_LOG_MAX_ITEMS = 200
+_CHANGE_PASSWORD_LOG_MAX_LINES = 700
+_change_password_logs: dict[str, dict[str, Any]] = {}
+
+
+def _cleanup_change_password_logs(now: float | None = None) -> None:
+    now = now or time.time()
+    expired = [
+        request_id
+        for request_id, entry in _change_password_logs.items()
+        if now - float(entry.get("updated_at") or 0) > _CHANGE_PASSWORD_LOG_TTL_SECONDS
+    ]
+    for request_id in expired:
+        _change_password_logs.pop(request_id, None)
+
+    overflow = len(_change_password_logs) - _CHANGE_PASSWORD_LOG_MAX_ITEMS
+    if overflow > 0:
+        oldest = sorted(
+            _change_password_logs,
+            key=lambda key: float(_change_password_logs[key].get("updated_at") or 0),
+        )
+        for request_id in oldest[:overflow]:
+            _change_password_logs.pop(request_id, None)
+
+
+def _append_change_password_log(request_id: str, msg: str) -> None:
+    if not request_id:
+        return
+    now = time.time()
+    entry = _change_password_logs.setdefault(
+        request_id,
+        {"logs": [], "done": False, "updated_at": now},
+    )
+    logs = entry.setdefault("logs", [])
+    logs.append(msg)
+    if len(logs) > _CHANGE_PASSWORD_LOG_MAX_LINES:
+        del logs[:-_CHANGE_PASSWORD_LOG_MAX_LINES]
+    entry["updated_at"] = now
+    _cleanup_change_password_logs(now)
+
+
+def _finish_change_password_log(request_id: str) -> None:
+    if not request_id:
+        return
+    entry = _change_password_logs.setdefault(
+        request_id,
+        {"logs": [], "done": False, "updated_at": time.time()},
+    )
+    entry["done"] = True
+    entry["updated_at"] = time.time()
+
+
+@app.on_event("startup")
+async def _start_proxy_rotate_service() -> None:
+    _proxy_rotate_service.start()
 
 
 # ─── Auth middleware (disabled) ───────────────────────────────────────
@@ -82,8 +158,18 @@ class SetConfigRequest(BaseModel):
         default=None,
         description="HTTP/HTTPS proxy URL. Empty string = direct (clear).",
     )
+    proxy_enabled: bool | None = None
     post_reg_get_session: bool | None = None
     post_reg_get_link: bool | None = None
+
+
+class ProxyRotateConfigRequest(BaseModel):
+    enabled: bool | None = None
+    command: str | None = Field(
+        default=None,
+        description="Rotate URL or curl command.",
+    )
+    interval_seconds: int | None = Field(default=None, ge=10, le=86400)
 
 
 @app.get("/api/jobs")
@@ -95,6 +181,8 @@ async def list_jobs() -> JSONResponse:
         "debug": manager.debug,
         "job_timeout": manager.job_timeout,
         "proxy": manager.proxy,
+        "proxy_enabled": manager.proxy_enabled,
+        "proxy_rotate": load_proxy_rotate(),
         "jobs": manager.list_jobs(),
     })
 
@@ -305,6 +393,8 @@ async def get_config() -> JSONResponse:
         "debug": manager.debug,
         "job_timeout": manager.job_timeout,
         "proxy": manager.proxy,
+        "proxy_enabled": manager.proxy_enabled,
+        "proxy_rotate": load_proxy_rotate(),
         "post_reg_get_session": manager.post_reg_get_session,
         "post_reg_get_link": manager.post_reg_get_link,
     })
@@ -328,10 +418,9 @@ async def set_config(payload: SetConfigRequest) -> JSONResponse:
         except ValueError as exc:
             raise HTTPException(400, str(exc))
     if payload.proxy is not None:
-        manager.set_proxy(payload.proxy)
-        # Lan proxy global sang Session + Link manager (single source of truth)
-        get_session_manager().set_proxy(payload.proxy)
-        get_link_manager().set_proxy(payload.proxy)
+        _apply_global_proxy(payload.proxy)
+    if payload.proxy_enabled is not None:
+        _apply_global_proxy_enabled(payload.proxy_enabled)
     if payload.post_reg_get_session is not None:
         manager.set_post_reg_get_session(payload.post_reg_get_session)
     if payload.post_reg_get_link is not None:
@@ -342,6 +431,8 @@ async def set_config(payload: SetConfigRequest) -> JSONResponse:
         "debug": manager.debug,
         "job_timeout": manager.job_timeout,
         "proxy": manager.proxy,
+        "proxy_enabled": manager.proxy_enabled,
+        "proxy_rotate": load_proxy_rotate(),
         "post_reg_get_session": manager.post_reg_get_session,
         "post_reg_get_link": manager.post_reg_get_link,
     })
@@ -444,6 +535,42 @@ async def test_proxy(payload: TestProxyRequest) -> JSONResponse:
     })
 
 
+@app.get("/api/proxy/rotate/config")
+async def get_proxy_rotate_config() -> JSONResponse:
+    cfg = load_proxy_rotate()
+    cfg["proxy"] = get_manager().proxy
+    return JSONResponse(cfg)
+
+
+@app.post("/api/proxy/rotate/config")
+async def set_proxy_rotate_config(payload: ProxyRotateConfigRequest) -> JSONResponse:
+    patch: dict[str, Any] = {}
+    if payload.enabled is not None:
+        patch["enabled"] = payload.enabled
+    if payload.command is not None:
+        patch["command"] = payload.command
+    if payload.interval_seconds is not None:
+        patch["interval_seconds"] = payload.interval_seconds
+    cfg = save_proxy_rotate(patch)
+    _proxy_rotate_service.restart()
+    cfg["proxy"] = get_manager().proxy
+    return JSONResponse(cfg)
+
+
+@app.post("/api/proxy/rotate-now")
+async def rotate_proxy_now() -> JSONResponse:
+    try:
+        cfg = await _proxy_rotate_service.rotate_once()
+    except Exception as exc:
+        cfg = save_proxy_rotate({
+            "last_run_at": time.time(),
+            "last_ok": False,
+            "last_message": f"{type(exc).__name__}: {exc}",
+        })
+        return JSONResponse({**cfg, "proxy": get_manager().proxy}, status_code=200)
+    return JSONResponse({**cfg, "proxy": get_manager().proxy})
+
+
 @app.get("/api/events")
 async def events(request: Request) -> StreamingResponse:
     """SSE stream cho realtime updates."""
@@ -460,6 +587,8 @@ async def events(request: Request) -> StreamingResponse:
                 "debug": manager.debug,
                 "job_timeout": manager.job_timeout,
                 "proxy": manager.proxy,
+        "proxy_enabled": manager.proxy_enabled,
+                "proxy_rotate": load_proxy_rotate(),
                 "post_reg_get_session": manager.post_reg_get_session,
                 "post_reg_get_link": manager.post_reg_get_link,
                 "jobs": manager.list_jobs(),
@@ -918,8 +1047,10 @@ async def check_plus(job_id: str) -> JSONResponse:
     if not token:
         raise HTTPException(422, "no access_token for this job")
 
+    _proxy = lm.proxy
+    _proxies = {"http": _proxy, "https": _proxy} if _proxy else None
     try:
-        async with CurlSession(impersonate="chrome136") as s:
+        async with CurlSession(impersonate="chrome136", proxies=_proxies) as s:
             r = await s.get(
                 "https://chatgpt.com/backend-api/me",
                 headers={"Authorization": f"Bearer {token}", "Accept": "*/*"},
@@ -968,8 +1099,10 @@ async def check_payment_link(job_id: str) -> JSONResponse:
         "browser_timezone": "Asia/Saigon",
         "redirect_type": "url",
     }
+    _proxy = lm.proxy
+    _proxies = {"http": _proxy, "https": _proxy} if _proxy else None
     try:
-        async with CurlSession(impersonate="chrome136") as s:
+        async with CurlSession(impersonate="chrome136", proxies=_proxies) as s:
             r = await s.post(url, headers=headers, data=data, timeout=15.0)
         body = r.json()
         err_code = (body.get("error") or {}).get("code") or ""
@@ -1013,11 +1146,15 @@ async def check_account_run(payload: CheckAccountRequest) -> JSONResponse:
 async def check_payment_sessions(request: Request) -> JSONResponse:
     """Check sessions for payment status via OpenAI checkout + Stripe init APIs.
 
-    Body: { sessions: [{token, email?}], region: "VN" }
+    Body: { sessions: [{token?, combo?, email?}], region: "VN" }
+      - If `token` provided: use directly.
+      - If `combo` provided (email|password|secret): login to obtain accessToken first,
+        then run the same payment check flow.
     Flow per session:
-      1. POST chatgpt.com checkout → checkout_session_id + publishable_key
-      2. POST api.stripe.com init → full Stripe data (hosted_url + invoice)
-      3. Parse amount_due / trial_period_days → is_free
+      1. (combo only) Browser login → /api/auth/session → accessToken
+      2. POST chatgpt.com checkout → checkout_session_id + publishable_key
+      3. POST api.stripe.com init → full Stripe data (hosted_url + invoice)
+      4. Parse amount_due / trial_period_days → is_free
     """
     import uuid as _uuid
 
@@ -1030,6 +1167,8 @@ async def check_payment_sessions(request: Request) -> JSONResponse:
         SessionExpiredError,
         CloudflareBlockedError,
     )
+    from ..session_phase import get_session, SessionError
+    from ..config import env_insecure_tls
     from curl_cffi.requests import AsyncSession as CurlSession
 
     try:
@@ -1042,19 +1181,98 @@ async def check_payment_sessions(request: Request) -> JSONResponse:
     if region not in REGION_BILLING:
         region = DEFAULT_REGION
 
+    # Reuse SessionJobManager's proxy/headless config for login.
+    sm = get_session_manager()
+    login_proxy = sm.proxy
+    login_headless = sm.headless
+    login_timeout = sm.job_timeout
+
     results: list[dict] = []
 
     for item in sessions_input:
         token = (item.get("token") or "").strip()
         hint_email = (item.get("email") or "").strip()
+        combo_raw = (item.get("combo") or "").strip()
         logs: list[str] = []
 
+        # Combo mode: login first to obtain accessToken
+        if not token and combo_raw:
+            parts = [p.strip() for p in combo_raw.split("|")]
+            if len(parts) < 2 or not parts[0] or not parts[1]:
+                results.append({
+                    "email": hint_email or combo_raw[:60],
+                    "error": "Combo format sai, cần: email|password|secret",
+                    "logs": logs,
+                })
+                continue
+            login_email = parts[0]
+            login_pass = parts[1]
+            login_secret = parts[2] if len(parts) >= 3 and parts[2] else None
+            hint_email = hint_email or login_email
+
+            def _log(msg: str, _logs=logs) -> None:
+                _logs.append(msg)
+
+            LOGIN_RETRY_MAX = 5
+            session_data = None
+            login_error: str | None = None
+            proxy_label = _mask_proxy(login_proxy) if login_proxy else "none"
+            for attempt in range(1, LOGIN_RETRY_MAX + 1):
+                try:
+                    _log(f"→ Login attempt {attempt}/{LOGIN_RETRY_MAX} for {login_email} (proxy={proxy_label})…")
+                    session_data = await asyncio.wait_for(
+                        get_session(
+                            email=login_email,
+                            password=login_pass,
+                            secret=login_secret,
+                            headless=login_headless,
+                            proxy=login_proxy,
+                            tls_insecure=env_insecure_tls(),
+                            log=_log,
+                        ),
+                        timeout=login_timeout,
+                    )
+                    break
+                except asyncio.TimeoutError:
+                    login_error = f"Login timeout {login_timeout:.0f}s"
+                    logs.append(f"✗ {login_error}")
+                    break
+                except SessionError as exc:
+                    msg = str(exc)
+                    retryable = ("browser launch" in msg.lower()) or ("driver" in msg.lower())
+                    if attempt < LOGIN_RETRY_MAX and retryable:
+                        logs.append(f"⚠ Browser/driver error (attempt {attempt}/{LOGIN_RETRY_MAX}): {exc} — retrying in 2s")
+                        await asyncio.sleep(2)
+                        continue
+                    login_error = f"Login failed: {exc}"
+                    logs.append(f"✗ {login_error}")
+                    break
+                except Exception as exc:
+                    login_error = f"Login error: {type(exc).__name__}: {exc}"
+                    logs.append(f"✗ {login_error}")
+                    break
+
+            if session_data is None:
+                results.append({"email": hint_email, "error": login_error or "Login failed", "logs": logs})
+                continue
+
+            token = (session_data or {}).get("accessToken") or ""
+            sd_email = ((session_data or {}).get("user") or {}).get("email") or ""
+            if sd_email:
+                hint_email = sd_email
+            if not token:
+                logs.append("✗ Login OK nhưng không lấy được accessToken")
+                results.append({"email": hint_email, "error": "Login OK but no accessToken in session", "logs": logs})
+                continue
+            logs.append(f"✓ Got accessToken ({len(token)} chars)")
+
         if not token:
-            results.append({"error": "Missing accessToken", "email": hint_email, "logs": logs})
+            results.append({"error": "Missing accessToken or combo", "email": hint_email, "logs": logs})
             continue
 
+        _proxies = {"http": login_proxy, "https": login_proxy} if login_proxy else None
         try:
-            async with CurlSession(impersonate="chrome136") as curl_session:
+            async with CurlSession(impersonate="chrome136", proxies=_proxies) as curl_session:
                 logs.append(f"→ Calling OpenAI checkout API (region={region})…")
                 checkout = await _call_chatgpt_checkout(
                     curl_session, token, region=region, timeout=30.0,
@@ -1154,6 +1372,7 @@ async def check_payment_sessions(request: Request) -> JSONResponse:
                     "product": product,
                     "payment_url": payment_url,
                     "session_id": checkout.checkout_session_id,
+                    "access_token": token,
                     "logs": logs,
                 })
 
@@ -1198,8 +1417,10 @@ async def stripe_poll_paid(request: Request) -> JSONResponse:
     if not session_id or not publishable_key:
         raise HTTPException(status_code=422, detail="session_id and publishable_key required")
 
+    _proxy = get_link_manager().proxy
+    _proxies = {"http": _proxy, "https": _proxy} if _proxy else None
     try:
-        async with CurlSession(impersonate=_IMPERSONATE) as curl_session:
+        async with CurlSession(impersonate=_IMPERSONATE, proxies=_proxies) as curl_session:
             data = await _call_stripe_init_full(
                 curl_session, session_id, publishable_key, timeout=15.0,
             )
@@ -1309,14 +1530,14 @@ async def watch_status() -> JSONResponse:
 
 @app.post("/api/link/watch/slot/{slot_idx}/action")
 async def watch_slot_action(slot_idx: int, request: Request) -> JSONResponse:
-    """action: done | fail | off"""
+    """action: done | fail | off | reload"""
     try:
         body = await request.json()
     except Exception:
         raise HTTPException(422, "Invalid JSON body")
     action = body.get("action") or ""
-    if action not in ("done", "fail", "off"):
-        raise HTTPException(422, "action must be done|fail|off")
+    if action not in ("done", "fail", "off", "reload"):
+        raise HTTPException(422, "action must be done|fail|off|reload")
     await _watch_manager.slot_action(slot_idx, action)
     return JSONResponse({"ok": True})
 
@@ -1335,6 +1556,86 @@ async def watch_slot_screenshot(slot_idx: int):
     if p is None or not p.exists():
         raise HTTPException(404, "No screenshot yet")
     return FileResponse(str(p), media_type="image/png")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Change Password
+# ─────────────────────────────────────────────────────────────────────
+
+
+@app.get("/api/change-password/log/{request_id}")
+async def change_password_log(request_id: str) -> JSONResponse:
+    _cleanup_change_password_logs()
+    entry = _change_password_logs.get(request_id) or {}
+    return JSONResponse({
+        "request_id": request_id,
+        "logs": list(entry.get("logs") or []),
+        "done": bool(entry.get("done")),
+    })
+
+
+@app.post("/api/change-password")
+async def change_password_endpoint(request: Request) -> JSONResponse:
+    """Change password for a ChatGPT account via browser automation.
+
+    Body: { combo: "email|current_pass|2fa_secret", new_password: "...", request_id?: "..." }
+    Returns: { success: bool, email: str, error?: str, logs: [...] }
+    """
+    from ..change_password_phase import change_password, ChangePasswordError
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="Invalid JSON body")
+
+    combo_raw: str = (body.get("combo") or "").strip()
+    new_password: str = (body.get("new_password") or "").strip()
+    request_id: str = (body.get("request_id") or "").strip()[:120]
+    if not combo_raw:
+        raise HTTPException(status_code=422, detail="combo is required")
+    if not new_password:
+        raise HTTPException(status_code=422, detail="new_password is required")
+
+    parts = [p.strip() for p in combo_raw.split("|")]
+    if len(parts) < 2 or not parts[0] or not parts[1]:
+        raise HTTPException(status_code=422, detail="combo must be email|password or email|password|2fa_secret")
+
+    email = parts[0]
+    current_password = parts[1]
+    secret = parts[2] if len(parts) >= 3 and parts[2] else None
+
+    # Use main JobManager for headless (controlled by global UI toggle) + proxy
+    mgr = get_manager()
+    logs: list[str] = []
+
+    def _log(msg: str) -> None:
+        logs.append(msg)
+        _append_change_password_log(request_id, msg)
+
+    try:
+        new_session = await change_password(
+            email=email,
+            current_password=current_password,
+            new_password=new_password,
+            secret=secret,
+            headless=mgr.headless,
+            proxy=mgr.effective_proxy,
+            log=_log,
+        )
+        _finish_change_password_log(request_id)
+        return JSONResponse({
+            "success": True,
+            "email": email,
+            "session": new_session,
+            "new_session": new_session,
+            "logs": logs,
+        })
+    except ChangePasswordError as exc:
+        _finish_change_password_log(request_id)
+        return JSONResponse({"success": False, "email": email, "error": str(exc), "logs": logs})
+    except Exception as exc:
+        _finish_change_password_log(request_id)
+        return JSONResponse({"success": False, "email": email, "error": f"Unexpected: {exc}", "logs": logs})
 
 
 # ─────────────────────────────────────────────────────────────────────
